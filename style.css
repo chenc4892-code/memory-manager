@@ -4,6 +4,9 @@
 #mem-fab-root {
   position: fixed;
   z-index: 99999;
+  /* ★ 给容器一个明确高度参考，让拉手能正确居中 */
+  width: 80px;
+  height: 80px;
   transition: opacity 0.3s, transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
   touch-action: none;
   user-select: none;
@@ -16,11 +19,11 @@
 
 /* ===== 停靠状态 ===== */
 #mem-fab-root.mem-docked-left {
-  transform: translateX(-68px);
+  transform: translateX(-80px);
 }
 
 #mem-fab-root.mem-docked-right {
-  transform: translateX(68px);
+  transform: translateX(80px);
 }
 
 #mem-fab-root.mem-docked-left:hover,
@@ -28,49 +31,63 @@
   transform: translateX(0);
 }
 
-/* ===== 停靠拉手 ===== */
+/* ===== 停靠拉手 ★ 重新设计 ===== */
+/*
+  结构：handle 本身是透明的大触控区，::before 是小的视觉指示条
+  这样触控区大但视觉很小巧
+*/
 .mem-dock-handle {
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
-  width: 24px;
+  /* ★ 触控区：宽大但完全透明 */
+  width: 36px;
   height: 56px;
-  background: linear-gradient(135deg, rgba(102, 126, 234, 0.85), rgba(118, 75, 162, 0.85));
-  border-radius: 0 12px 12px 0;
+  background: transparent;
   display: none;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  color: white;
-  font-size: 14px;
-  font-weight: bold;
-  box-shadow: 2px 2px 10px rgba(0, 0, 0, 0.2);
-  backdrop-filter: blur(8px);
-  animation: mem-handle-pulse 2s infinite;
+  z-index: 1;
+  /* 无 padding/margin hack */
 }
 
+/* ★ 视觉指示条：小而精致 */
+.mem-dock-handle::before {
+  content: '';
+  display: block;
+  width: 4px;
+  height: 24px;
+  background: var(--SmartThemeBlurTintColor, rgba(140, 140, 160, 0.5));
+  border-radius: 2px;
+  transition: all 0.25s;
+}
+
+/* 左停靠：拉手贴屏幕右边缘 */
 #mem-fab-root.mem-docked-left .mem-dock-handle {
-  right: -24px;
+  /* ★ 80(球宽) - 80(translateX藏入) = 0，所以拉手在 right:0 处就是屏幕边缘 */
+  right: -36px;
   display: flex;
-  border-radius: 0 12px 12px 0;
 }
 
+/* 右停靠：拉手贴屏幕左边缘 */
 #mem-fab-root.mem-docked-right .mem-dock-handle {
-  left: -24px;
+  left: -36px;
   display: flex;
-  border-radius: 12px 0 0 12px;
 }
 
-@keyframes mem-handle-pulse {
+/* 拉手 hover：指示条变亮变长 */
+.mem-dock-handle:hover::before {
+  height: 30px;
+  width: 5px;
+  background: var(--SmartThemeChatFontColor, rgba(180, 180, 200, 0.7));
+  box-shadow: 0 0 8px rgba(102, 126, 234, 0.3);
+}
 
-  0%,
-  100% {
-    opacity: 0.7;
-  }
-
-  50% {
-    opacity: 1;
-  }
+/* 拉手按下 */
+.mem-dock-handle:active::before {
+  height: 20px;
+  background: rgba(102, 126, 234, 0.8);
 }
 
 /* ===== 主按钮 ===== */
@@ -81,7 +98,7 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s;
   position: relative;
   border-radius: 50%;
 }
@@ -709,23 +726,60 @@
   margin-top: 10px;
 }
 
-/* 拖拽状态 */
+/* ===== 拖拽状态 ===== */
 #mem-fab-root.mem-dragging {
   transition: none !important;
-  opacity: 0.85;
+  opacity: 0.75;
 }
 
 #mem-fab-root.mem-dragging * {
   pointer-events: none !important;
 }
 
+/* ★ 停靠时：球完全隐藏，只露拉手 */
+#mem-fab-root.mem-docked-left .mem-fab-main,
+#mem-fab-root.mem-docked-right .mem-fab-main {
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+#mem-fab-root.mem-docked-left:hover .mem-fab-main,
+#mem-fab-root.mem-docked-right:hover .mem-fab-main {
+  pointer-events: auto;
+  opacity: 1;
+}
+
 /* 移动端 */
 @media (max-width: 768px) {
+
+  /* ★ 移动端也给容器明确尺寸 */
+  #mem-fab-root {
+    width: 64px;
+    height: 64px;
+  }
 
   .mem-fab-main,
   .mem-fab-icon {
     width: 64px;
     height: 64px;
+  }
+
+  /* ★ 移动端停靠偏移量跟着变 */
+  #mem-fab-root.mem-docked-left {
+    transform: translateX(-64px);
+  }
+
+  #mem-fab-root.mem-docked-right {
+    transform: translateX(64px);
+  }
+
+  #mem-fab-root.mem-docked-left .mem-dock-handle {
+    right: -36px;
+  }
+
+  #mem-fab-root.mem-docked-right .mem-dock-handle {
+    left: -36px;
   }
 
   .mem-fab-menu-item {
