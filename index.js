@@ -1,7 +1,8 @@
-// ==================== 回忆世界书管理器 v2.8.0 (SillyTavern Extension) ====================
-// v2.8.0 修复:
-// - ★ 核心修复：刷新时检测 SillyTavern 实际激活的世界书
-// - 优先级：实际激活 > 保存的偏好 > 主线 > 第一个
+// ==================== 回忆世界书管理器 v2.9.0 (SillyTavern Extension) ====================
+// v2.9.0:
+// - ★ 新增：总结指令面板（替换写入面板）
+// - ★ 大总结 / 二次总结 一键发送
+// - 保留 🔄 解析全部按钮用于手动写入世界书
 import { extension_settings, getContext } from '../../../extensions.js';
 import { saveSettingsDebounced, getRequestHeaders } from '../../../../script.js';
 
@@ -43,6 +44,20 @@ const CONFIG = {
     '===开始===': { comment: '===开始===', type: 'constant', position: 'after_character_definition', order: 1004, content: '<memory>' },
     '回忆': { comment: '回忆', type: 'constant', position: 'after_character_definition', order: 1005, content: '# 回忆\n' },
     '===结束===': { comment: '===结束===', type: 'constant', position: 'after_character_definition', order: 1200, content: '</memory>' },
+  },
+
+  // ★ 新增：总结指令模板
+  SUMMARY_PROMPTS: {
+    full: `[OOC: 停止角色扮演。请从第一天开始，对到目前为止的所有剧情进行完整总结。
+    ]`,
+
+    compress: `[OOC: 停止角色扮演。请从第一天开始，对到目前为止的所有剧情进行二次压缩总结。
+
+**压缩原则（务必遵守）：**
+1. 对于「## 回忆」部分：尽量不要写入角色的主观感受。格外关注事件因果逻辑，尽可能不丢失事件因果链以及关键信息。
+2. 对于无法进一步压缩的已有 <memory> 内容：可以改写成英文或文言文来节约token。
+3. 合并同类事件，删除冗余描述和修饰性语句，只保留核心事实。
+]`,
   },
 };
 
@@ -166,121 +181,42 @@ const ST = {
     return [];
   },
 
-  // ★★★ 新增：获取当前已激活的世界书列表 ★★★
   async getActiveWorldBooks() {
     log('正在检测已激活的世界书...');
-
-    // 方法1: world-info 模块的 selected_world_info（最可靠）
     try {
       const wi = await getWiModule();
       if (wi) {
-        // SillyTavern 的 world-info.js 导出 selected_world_info 数组
-        const candidates = [
-          wi.selected_world_info,
-          wi.getActiveWorldNames?.(),
-          wi.active_world,
-        ];
-
+        const candidates = [wi.selected_world_info, wi.getActiveWorldNames?.(), wi.active_world];
         for (const c of candidates) {
           if (c) {
             let result = null;
-            if (Array.isArray(c) && c.length > 0) {
-              result = [...c];
-            } else if (c instanceof Set && c.size > 0) {
-              result = [...c];
-            } else if (typeof c === 'string' && c.trim()) {
-              result = c.split(',').map(s => s.trim()).filter(Boolean);
-            }
-            if (result && result.length > 0) {
-              log('检测到已激活世界书:', result);
-              return result;
-            }
+            if (Array.isArray(c) && c.length > 0) result = [...c];
+            else if (c instanceof Set && c.size > 0) result = [...c];
+            else if (typeof c === 'string' && c.trim()) result = c.split(',').map(s => s.trim()).filter(Boolean);
+            if (result && result.length > 0) { log('检测到已激活世界书:', result); return result; }
           }
         }
-        log('world-info 模块中未找到激活信息');
       }
     } catch (e) { log('方法1失败', e); }
-
-    // 方法2: 检查 window 全局变量
-    try {
-      if (typeof window.selected_world_info !== 'undefined') {
-        const swi = window.selected_world_info;
-        if (Array.isArray(swi) && swi.length > 0) {
-          log('从 window.selected_world_info 获取:', swi);
-          return [...swi];
-        }
-      }
-    } catch { }
-
-    // 方法3: 检查 SillyTavern 的 power_user 设置
-    try {
-      if (typeof window.power_user !== 'undefined' && window.power_user?.world_info) {
-        const wi = window.power_user.world_info;
-        if (typeof wi === 'string' && wi.trim()) {
-          const result = wi.split(',').map(s => s.trim()).filter(Boolean);
-          if (result.length > 0) {
-            log('从 power_user.world_info 获取:', result);
-            return result;
-          }
-        }
-      }
-    } catch { }
-
-    // 方法4: 检查 SillyTavern DOM（最后手段）
-    try {
-      const checkboxes = document.querySelectorAll('#world_info .world_entry input[type="checkbox"]:checked');
-      if (checkboxes.length > 0) {
-        const names = [];
-        checkboxes.forEach(cb => {
-          const entry = cb.closest('.world_entry');
-          const nameEl = entry?.querySelector('.world_name');
-          if (nameEl?.textContent) names.push(nameEl.textContent.trim());
-        });
-        if (names.length > 0) {
-          log('从 DOM 获取:', names);
-          return names;
-        }
-      }
-    } catch { }
-
-    // 方法5: 尝试通过 getContext 获取
-    try {
-      const ctx = getContext();
-      if (ctx?.worldInfoActivated && Array.isArray(ctx.worldInfoActivated)) {
-        log('从 context.worldInfoActivated 获取:', ctx.worldInfoActivated);
-        return [...ctx.worldInfoActivated];
-      }
-    } catch { }
-
+    try { if (typeof window.selected_world_info !== 'undefined') { const swi = window.selected_world_info; if (Array.isArray(swi) && swi.length > 0) return [...swi]; } } catch { }
+    try { if (typeof window.power_user !== 'undefined' && window.power_user?.world_info) { const wi = window.power_user.world_info; if (typeof wi === 'string' && wi.trim()) { const r = wi.split(',').map(s => s.trim()).filter(Boolean); if (r.length > 0) return r; } } } catch { }
+    try { const ctx = getContext(); if (ctx?.worldInfoActivated && Array.isArray(ctx.worldInfoActivated)) return [...ctx.worldInfoActivated]; } catch { }
     log('所有方法都未检测到已激活世界书');
     return [];
   },
 
   async createWorld(name) {
     log(`创建世界书: "${name}"`);
-    try {
-      const wi = await getWiModule();
-      if (wi?.createNewWorldInfo) {
-        await wi.createNewWorldInfo(name);
-        log('通过模块创建成功');
-        return true;
-      }
-    } catch (e) { log('模块创建失败', e); }
+    try { const wi = await getWiModule(); if (wi?.createNewWorldInfo) { await wi.createNewWorldInfo(name); return true; } } catch (e) { log('模块创建失败', e); }
     for (const ep of ['/api/worldinfo/create', '/createworldinfo']) {
-      try {
-        const r = await fetch(ep, { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ name }) });
-        if (r.ok) { log(`通过 ${ep} 创建成功`); return true; }
-      } catch { }
+      try { const r = await fetch(ep, { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ name }) }); if (r.ok) return true; } catch { }
     }
-    error(`创建失败: "${name}"`);
-    return false;
+    error(`创建失败: "${name}"`); return false;
   },
 
   async setWorldActive(name, active = true) {
-    try {
-      await this.execSlash(active ? `/world ${name}` : `/world state=off silent=true ${name}`);
-      return true;
-    } catch (e) { log(`激活 "${name}"=${active} 失败`, e); return false; }
+    try { await this.execSlash(active ? `/world ${name}` : `/world state=off silent=true ${name}`); return true; }
+    catch (e) { log(`激活 "${name}"=${active} 失败`, e); return false; }
   },
 };
 
@@ -299,17 +235,9 @@ class OperationQueue {
     this.processing = true;
     const item = this.queue.shift();
     this.currentOp = item.name;
-    try {
-      const r = await item.fn();
-      await wait(CONFIG.OPERATION_DELAY);
-      item.resolve(r);
-    } catch (e) {
-      error(`[队列] ✗ ${item.name}`, e);
-      item.reject(e);
-    } finally {
-      this.processing = false; this.currentOp = null;
-      if (this.queue.length) this._run();
-    }
+    try { const r = await item.fn(); await wait(CONFIG.OPERATION_DELAY); item.resolve(r); }
+    catch (e) { error(`[队列] ✗ ${item.name}`, e); item.reject(e); }
+    finally { this.processing = false; this.currentOp = null; if (this.queue.length) this._run(); }
   }
 }
 const opQueue = new OperationQueue();
@@ -324,11 +252,7 @@ class LorebookManager {
   }
 
   async _findUid(bookName, comment) {
-    try {
-      const r = await ST.execSlash(`/findentry file="${bookName}" field=comment ${comment}`);
-      const t = r?.trim();
-      if (t && t !== '' && !isNaN(t)) return parseInt(t);
-    } catch { }
+    try { const r = await ST.execSlash(`/findentry file="${bookName}" field=comment ${comment}`); const t = r?.trim(); if (t && t !== '' && !isNaN(t)) return parseInt(t); } catch { }
     return null;
   }
 
@@ -339,28 +263,20 @@ class LorebookManager {
       log(`[创建] "${comment}" → "${bookName}"`);
       const uidStr = await ST.execSlash(`/createentry file="${bookName}" ${content}`);
       const uid = uidStr?.trim();
-      if (!uid || uid === '' || isNaN(uid)) {
-        error(`创建失败: "${comment}", 返回: "${uidStr}"`);
-        return null;
-      }
+      if (!uid || uid === '' || isNaN(uid)) { error(`创建失败: "${comment}"`); return null; }
       await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=comment ${comment}`);
-      if (entryConfig.type === 'constant')
-        await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=constant true`);
+      if (entryConfig.type === 'constant') await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=constant true`);
       await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=position ${posNum}`);
-      if (entryConfig.order !== undefined)
-        await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=order ${entryConfig.order}`);
-      if (posNum >= 4 && entryConfig.depth)
-        await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=depth ${entryConfig.depth}`);
+      if (entryConfig.order !== undefined) await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=order ${entryConfig.order}`);
+      if (posNum >= 4 && entryConfig.depth) await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=depth ${entryConfig.depth}`);
       log(`[创建] "${comment}" UID=${uid} ✓`);
       return parseInt(uid);
     } catch (e) { error(`创建 "${comment}" 异常`, e); return null; }
   }
 
   async _updateContent(bookName, uid, content) {
-    try {
-      await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=content ${content}`);
-      return true;
-    } catch (e) { error(`更新 UID=${uid} 失败`, e); return false; }
+    try { await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=content ${content}`); return true; }
+    catch (e) { error(`更新 UID=${uid} 失败`, e); return false; }
   }
 
   async _upsertEntry(comment, content, config = {}) {
@@ -370,9 +286,8 @@ class LorebookManager {
       uid = await this._findUid(this.lorebookName, comment);
       if (uid !== null) this.entryUids[comment] = uid;
     }
-    if (uid !== null && uid !== undefined) {
-      await this._updateContent(this.lorebookName, uid, content);
-    } else {
+    if (uid !== null && uid !== undefined) { await this._updateContent(this.lorebookName, uid, content); }
+    else {
       const newUid = await this._createEntry(this.lorebookName, comment, content, config);
       if (newUid !== null) this.entryUids[comment] = newUid;
     }
@@ -387,8 +302,6 @@ class LorebookManager {
       if (uid !== null) this.entryUids[name] = uid;
       await wait(50);
     }
-    const found = Object.keys(this.entryUids).length;
-    log(`条目: ${found}/${Object.keys(CONFIG.ENTRIES).length}`, this.entryUids);
     const missing = Object.keys(CONFIG.ENTRIES).filter(n => this.entryUids[n] === undefined);
     if (missing.length > 0) {
       log(`补建 ${missing.length} 个: ${missing.join(', ')}`);
@@ -401,72 +314,33 @@ class LorebookManager {
     }
   }
 
-  // ★★★ 核心修复：init 检测实际激活的世界书 ★★★
   async init(force = false) {
     return opQueue.enqueue('初始化', async () => {
       if (!force && this.initialized) return;
       this.charName = ST.getCharName();
-      log('角色:', this.charName);
-
       if (!this.charName || this.charName === '未知角色' || this.charName === 'undefined') {
         this.lorebookName = null; this.entryUids = {}; this.initialized = false;
         updateSettingsStatus('⚠️ 请先选择角色'); return;
       }
-
       const books = await this.getCharMemoryBooks();
       const baseName = `${this.charName}${CONFIG.LOREBOOK_SUFFIX}`;
       const savedBook = getSettings().lastUsedBooks?.[this.charName];
-
-      log(`可选世界书: ${books.join(', ')}`);
-      log(`保存的偏好: ${savedBook || '无'}`);
-
-      // ★★★ 优先级 1：检测 SillyTavern 中【实际激活】的世界书 ★★★
       const activeWorlds = await ST.getActiveWorldBooks();
-      log('当前全局激活的世界书:', activeWorlds);
-
       const activeMemBook = books.find(b => activeWorlds.includes(b));
 
-      if (activeMemBook) {
-        this.lorebookName = activeMemBook;
-        log(`✓ 检测到已激活的回忆世界书: ${activeMemBook}`);
-      }
-      // 优先级 2：上次通过插件选择的
-      else if (savedBook && books.includes(savedBook)) {
-        this.lorebookName = savedBook;
-        log(`✓ 使用记住的: ${savedBook}`);
-      }
-      // 优先级 3：主线
-      else if (books.includes(baseName)) {
-        this.lorebookName = baseName;
-        log(`✓ 使用主线: ${baseName}`);
-      }
-      // 优先级 4：第一个
-      else if (books.length > 0) {
-        this.lorebookName = books[0];
-        log(`✓ 使用第一个: ${books[0]}`);
-      } else {
-        this.lorebookName = null;
-        log('✗ 没有可用的回忆世界书');
-      }
+      if (activeMemBook) { this.lorebookName = activeMemBook; log(`✓ 已激活: ${activeMemBook}`); }
+      else if (savedBook && books.includes(savedBook)) { this.lorebookName = savedBook; }
+      else if (books.includes(baseName)) { this.lorebookName = baseName; }
+      else if (books.length > 0) { this.lorebookName = books[0]; }
+      else { this.lorebookName = null; }
 
-      if (this.lorebookName) {
-        await this._loadEntryMap();
-        saveLastUsedBook(this.charName, this.lorebookName);
-      } else {
-        this.entryUids = {};
-      }
+      if (this.lorebookName) { await this._loadEntryMap(); saveLastUsedBook(this.charName, this.lorebookName); }
+      else { this.entryUids = {}; }
 
       this.initialized = true;
       updateSettingsStatus(this.lorebookName ? '✅ 运行中' : '⏳ 未绑定');
       updateSettingsBook(this.lorebookName || '无');
       updateSettingsChar(this.charName);
-
-      // ★ 额外：告诉用户检测结果
-      if (activeMemBook) {
-        log(`最终绑定: ${activeMemBook} (来源: 全局激活检测)`);
-      } else if (this.lorebookName) {
-        log(`最终绑定: ${this.lorebookName} (来源: ${savedBook === this.lorebookName ? '偏好记忆' : '自动选择'})`);
-      }
     });
   }
 
@@ -479,7 +353,6 @@ class LorebookManager {
       const pattern = `${cn}${CONFIG.LOREBOOK_SUFFIX}`;
       const result = allBooks.filter(b => b.startsWith(pattern));
       result.sort((a, b) => a === pattern ? -1 : b === pattern ? 1 : a.localeCompare(b));
-      log(`找到 ${result.length} 个回忆世界书:`, result);
       return result;
     } catch (e) { error('获取列表失败', e); return []; }
   }
@@ -487,9 +360,7 @@ class LorebookManager {
   async deactivateOthers(except = null) {
     try {
       const books = await this.getCharMemoryBooks();
-      for (const b of books) {
-        if (b !== except) { await ST.setWorldActive(b, false); await wait(100); }
-      }
+      for (const b of books) { if (b !== except) { await ST.setWorldActive(b, false); await wait(100); } }
     } catch (e) { log('取消激活失败', e); }
   }
 
@@ -500,28 +371,20 @@ class LorebookManager {
       const name = `${cn}${CONFIG.LOREBOOK_SUFFIX}`;
       const all = await ST.getAllWorldNames();
       if (all.includes(name)) {
-        await this.deactivateOthers(name);
-        await ST.setWorldActive(name, true);
-        this.lorebookName = name; this.charName = cn;
-        await this._loadEntryMap();
-        saveLastUsedBook(cn, name);
-        await ST.toast(`✅ "${name}" 已激活`);
+        await this.deactivateOthers(name); await ST.setWorldActive(name, true);
+        this.lorebookName = name; this.charName = cn; await this._loadEntryMap();
+        saveLastUsedBook(cn, name); await ST.toast(`✅ "${name}" 已激活`);
         updateSettingsBook(name); return name;
       }
       const ok = await ST.createWorld(name);
       if (!ok) { await ST.toast('❌ 创建失败'); return null; }
       this.lorebookName = name; this.charName = cn; this.entryUids = {};
-      await wait(800);
-      await this.deactivateOthers(name);
-      await ST.setWorldActive(name, true);
-      await wait(500);
+      await wait(800); await this.deactivateOthers(name); await ST.setWorldActive(name, true); await wait(500);
       for (const [n, cfg] of Object.entries(CONFIG.ENTRIES)) {
         const uid = await this._createEntry(name, n, cfg.content, cfg);
-        if (uid !== null) this.entryUids[n] = uid;
-        await wait(200);
+        if (uid !== null) this.entryUids[n] = uid; await wait(200);
       }
-      saveLastUsedBook(cn, name);
-      await ST.toast(`✅ "${name}" 创建成功`);
+      saveLastUsedBook(cn, name); await ST.toast(`✅ "${name}" 创建成功`);
       updateSettingsBook(name); return name;
     });
   }
@@ -536,29 +399,22 @@ class LorebookManager {
       const ok = await ST.createWorld(newName);
       if (!ok) { await ST.toast('❌ 创建失败'); return null; }
       this.lorebookName = newName; this.charName = cn; this.entryUids = {};
-      await wait(800);
-      await this.deactivateOthers(newName);
-      await ST.setWorldActive(newName, true);
-      await wait(500);
+      await wait(800); await this.deactivateOthers(newName); await ST.setWorldActive(newName, true); await wait(500);
       for (const [n, cfg] of Object.entries(CONFIG.ENTRIES)) {
         const uid = await this._createEntry(newName, n, cfg.content, cfg);
-        if (uid !== null) this.entryUids[n] = uid;
-        await wait(200);
+        if (uid !== null) this.entryUids[n] = uid; await wait(200);
       }
-      saveLastUsedBook(cn, newName);
-      await ST.toast(`✅ "${newName}" 创建成功`);
+      saveLastUsedBook(cn, newName); await ST.toast(`✅ "${newName}" 创建成功`);
       updateSettingsBook(newName); return newName;
     });
   }
 
   async switchTo(bookName) {
     return opQueue.enqueue(`切换: ${bookName}`, async () => {
-      await this.deactivateOthers(bookName);
-      await wait(200);
+      await this.deactivateOthers(bookName); await wait(200);
       await ST.setWorldActive(bookName, true);
       this.lorebookName = bookName; this.entryUids = {};
-      await wait(300);
-      await this._loadEntryMap();
+      await wait(300); await this._loadEntryMap();
       saveLastUsedBook(this.charName, bookName);
       await ST.toast(`✅ 已切换: ${bookName}`);
       updateSettingsBook(bookName); return true;
@@ -574,10 +430,7 @@ class LorebookManager {
       if (all.includes(newName)) { await ST.toast(`⚠️ "${newName}" 已存在`); return false; }
       const ok = await ST.createWorld(newName);
       if (!ok) { await ST.toast('❌ 创建失败'); return false; }
-      await wait(800);
-      await this.deactivateOthers(newName);
-      await ST.setWorldActive(newName, true);
-      await wait(500);
+      await wait(800); await this.deactivateOthers(newName); await ST.setWorldActive(newName, true); await wait(500);
       const oldBook = this.lorebookName;
       const oldUids = { ...this.entryUids };
       this.entryUids = {};
@@ -586,12 +439,10 @@ class LorebookManager {
           const content = await ST.execSlash(`/getentryfield file="${oldBook}" field=content ${uid}`);
           const cfg = CONFIG.ENTRIES[comment] || {};
           const newUid = await this._createEntry(newName, comment, content || cfg.content || '', cfg);
-          if (newUid !== null) this.entryUids[comment] = newUid;
-          await wait(150);
+          if (newUid !== null) this.entryUids[comment] = newUid; await wait(150);
         } catch (e) { error(`复制 "${comment}" 失败`, e); }
       }
-      this.lorebookName = newName;
-      saveLastUsedBook(cn, newName);
+      this.lorebookName = newName; saveLastUsedBook(cn, newName);
       await ST.toast(`✅ 已复制到 "${newName}"`);
       updateSettingsBook(newName); return true;
     });
@@ -612,8 +463,7 @@ class LorebookManager {
     const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const sp = startTitles.map(t => `#{1,6}\\s*${esc(t)}`).join('|');
     const ep = endTitles.length > 0 ? endTitles.map(t => `#{1,6}\\s*${esc(t)}`).join('|') : null;
-    const re = ep ? new RegExp(`((?:${sp})[\\s\\S]*?)(?=(?:${ep})|$)`, 'i')
-      : new RegExp(`((?:${sp})[\\s\\S]*)$`, 'i');
+    const re = ep ? new RegExp(`((?:${sp})[\\s\\S]*?)(?=(?:${ep})|$)`, 'i') : new RegExp(`((?:${sp})[\\s\\S]*)$`, 'i');
     return text.match(re)?.[1]?.trim() || null;
   }
 
@@ -665,16 +515,10 @@ class FloorManager {
       if (!match) { await ST.toast('❌ 未找到"当前剧情提示"'); return false; }
       const plot = match[1].trim();
       if (saveToVar) {
-        try {
-          const esc = plot.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
-          if (esc.length < 5000) await ST.execSlash(`/setvar key=current_plot_prompt "${esc}"`);
-        } catch { }
+        try { const esc = plot.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r'); if (esc.length < 5000) await ST.execSlash(`/setvar key=current_plot_prompt "${esc}"`); } catch { }
       }
       if (sendAsMessage) {
-        try {
-          const cmds = { sys: `/sys ${plot}`, narrator: `/sendas name=📜剧情提示 ${plot}`, user: `/send ${plot}` };
-          await ST.execSlash(cmds[messageMode] || cmds.sys);
-        } catch (e) { error('发送失败', e); }
+        try { const cmds = { sys: `/sys ${plot}`, narrator: `/sendas name=📜剧情提示 ${plot}`, user: `/send ${plot}` }; await ST.execSlash(cmds[messageMode] || cmds.sys); } catch (e) { error('发送失败', e); }
       }
       if (hideOriginal) { try { await ST.execSlash(`/hide ${idx}`); } catch { } }
       await ST.toast('✅ 完成'); return true;
@@ -733,22 +577,24 @@ async function parseFull() {
   }
 }
 
-async function parseSingle(section) {
-  if (!await ensureBound()) return;
-  const lastMsg = ST.getLastMessage();
-  if (!lastMsg) { await ST.toast('❌ 没有消息'); return; }
-  const text = lastMsg.mes || lastMsg.message || '';
-  const P = {
-    parse_new_characters: { r: /#{1,6}\s*新增角色(?:信息)?[\s\S]*?(?=#{1,6}\s*(?:角色变化|回忆|重要物品|主要角色关键事件|当前剧情提示)|$)/i, n: 'new_characters' },
-    parse_character_changes: { r: /#{1,6}\s*角色变化(?:总结)?[\s\S]*?(?=#{1,6}\s*(?:回忆|重要物品|主要角色关键事件|当前剧情提示)|$)/i, n: 'character_changes' },
-    parse_memory: { r: /#{1,6}\s*回忆[\s\S]*?(?=#{1,6}\s*(?:重要物品|主要角色关键事件|当前剧情提示)|$)/i, n: 'memory' },
-    parse_items: { r: /#{1,6}\s*重要物品(?:记录)?[\s\S]*?(?=#{1,6}\s*(?:主要角色关键事件|关键事件|当前剧情提示)|$)/i, n: 'items' },
-    parse_key_events: { r: /#{1,6}\s*(?:主要角色)?关键事件(?:记录)?[\s\S]*?(?=#{1,6}\s*当前剧情提示|$)/i, n: 'key_events' },
-  };
-  const p = P[section]; if (!p) return;
-  const m = text.match(p.r);
-  if (m) await manager.updateSingle(p.n, m[0].trim());
-  else await ST.toast('⚠️ 未找到对应内容');
+// ★★★ 新增：发送总结指令 ★★★
+async function sendSummaryCommand(type) {
+  const prompt = CONFIG.SUMMARY_PROMPTS[type];
+  if (!prompt) {
+    await ST.toast('❌ 未知的总结类型');
+    return;
+  }
+
+  try {
+    log(`发送总结指令: ${type}`);
+    await ST.execSlash(`/send ${prompt}`);
+
+    const typeNames = { full: '📋 大总结', compress: '🗜️ 二次总结' };
+    await ST.toast(`✅ ${typeNames[type] || type} 指令已发送！请等待AI回复后点击🔄解析写入`);
+  } catch (e) {
+    error('发送总结指令失败', e);
+    await ST.toast('❌ 发送失败，请查看控制台');
+  }
 }
 
 // ==================== UI ====================
@@ -759,10 +605,10 @@ function buildFabHTML() {
   <div class="mem-fab-main" id="memFabMain"><div class="mem-fab-icon"></div></div>
   <div class="mem-fab-menu">
     <div class="mem-fab-menu-item" data-action="open_settings"><span>⚙️</span><div class="mem-fab-tooltip">存档设置</div></div>
-    <div class="mem-fab-menu-item" data-action="open_write"><span>✍️</span><div class="mem-fab-tooltip">写入世界书</div></div>
+    <div class="mem-fab-menu-item" data-action="open_summary"><span>📝</span><div class="mem-fab-tooltip">总结指令</div></div>
     <div class="mem-fab-menu-item" data-action="open_floor"><span>📋</span><div class="mem-fab-tooltip">楼层管理</div></div>
     <div class="mem-fab-menu-item" data-action="open_help"><span>📖</span><div class="mem-fab-tooltip">使用说明</div></div>
-    <div class="mem-fab-menu-item" data-action="parse_all"><span>🔄</span><div class="mem-fab-tooltip">解析全部</div></div>
+    <div class="mem-fab-menu-item" data-action="parse_all"><span>🔄</span><div class="mem-fab-tooltip">解析写入</div></div>
     <div class="mem-fab-menu-item" data-action="create_book"><span>📚</span><div class="mem-fab-tooltip">创建世界书</div></div>
   </div>
 </div>
@@ -784,21 +630,57 @@ function buildPanelsHTML() {
     <div class="mem-group"><div class="mem-group-title">📋 复制当前</div><label class="mem-input-label">新后缀</label><input type="text" class="mem-input" id="memCopySuffix" placeholder="例如：备份"><div class="mem-btn-grid" style="margin-top:10px"><button class="mem-btn mem-btn-secondary mem-btn-full" id="memCopyBook">📋 复制</button></div></div>
   </div>
 </div>
-<div class="mem-panel-overlay" id="memWritePanel">
+
+<!-- ★★★ 新增：总结指令面板（替代原写入面板）★★★ -->
+<div class="mem-panel-overlay" id="memSummaryPanel">
   <div class="mem-panel">
-    <div class="mem-panel-header"><div class="mem-panel-title">✍️ 写入世界书</div><button class="mem-panel-close" id="memCloseWrite">×</button></div>
-    <div class="mem-info-card"><div class="mem-info-label">写入到</div><div class="mem-info-value" id="memWriteTarget">点击刷新</div></div>
-    <div class="mem-btn-grid" style="margin-bottom:20px"><button class="mem-btn mem-btn-secondary" id="memWriteRefresh">🔍 刷新</button><button class="mem-btn mem-btn-secondary" id="memWriteSwitch">📚 切换</button></div>
-    <div class="mem-write-grid">
-      <button class="mem-write-btn" data-parse="parse_new_characters"><span class="mem-write-btn-icon">👥</span><span class="mem-write-btn-text">新增角色</span></button>
-      <button class="mem-write-btn" data-parse="parse_character_changes"><span class="mem-write-btn-icon">🔄</span><span class="mem-write-btn-text">角色变化</span></button>
-      <button class="mem-write-btn" data-parse="parse_memory"><span class="mem-write-btn-icon">📖</span><span class="mem-write-btn-text">回忆</span></button>
-      <button class="mem-write-btn" data-parse="parse_items"><span class="mem-write-btn-icon">🎒</span><span class="mem-write-btn-text">物品记录</span></button>
-      <button class="mem-write-btn" data-parse="parse_key_events"><span class="mem-write-btn-icon">⭐</span><span class="mem-write-btn-text">关键事件</span></button>
-      <button class="mem-write-btn" data-parse="parse_summary"><span class="mem-write-btn-icon">📑</span><span class="mem-write-btn-text">全部解析</span></button>
+    <div class="mem-panel-header">
+      <div class="mem-panel-title">📝 总结指令</div>
+      <button class="mem-panel-close" id="memCloseSummary">×</button>
+    </div>
+
+    <p style="font-size:13px;color:#666;margin:0 0 20px 0;line-height:1.6;">
+      选择总结类型，指令将以用户消息发送。<br>AI回复后点击 <b>🔄解析写入</b> 写入世界书。
+    </p>
+
+    <!-- 大总结卡片 -->
+    <div class="mem-summary-card" id="memSummaryFull">
+      <div class="mem-summary-card-icon">📋</div>
+      <div class="mem-summary-card-body">
+        <div class="mem-summary-card-title">大总结</div>
+        <div class="mem-summary-card-desc">
+          停止角色扮演，从第一天开始<br>对所有剧情进行完整总结
+        </div>
+      </div>
+      <div class="mem-summary-card-arrow">→</div>
+    </div>
+
+    <!-- 二次总结卡片 -->
+    <div class="mem-summary-card mem-summary-card-compress" id="memSummaryCompress">
+      <div class="mem-summary-card-icon">🗜️</div>
+      <div class="mem-summary-card-body">
+        <div class="mem-summary-card-title">二次总结（压缩）</div>
+        <div class="mem-summary-card-desc">
+          停止角色扮演，对已有内容深度压缩
+        </div>
+        <div class="mem-summary-card-rules">
+          <span>📌 回忆去主观感受，保因果链</span>
+          <span>📌 不可压缩 → 英文/文言文</span>
+        </div>
+      </div>
+      <div class="mem-summary-card-arrow">→</div>
+    </div>
+
+    <div class="mem-divider"></div>
+
+    <!-- 当前绑定的世界书 -->
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:rgba(0,0,0,0.02);border-radius:12px;">
+      <span style="font-size:12px;color:#888;">写入目标：</span>
+      <span style="font-size:13px;font-weight:600;color:#667eea;" id="memSummaryTarget">点击🔄刷新</span>
     </div>
   </div>
 </div>
+
 <div class="mem-panel-overlay" id="memFloorPanel">
   <div class="mem-panel">
     <div class="mem-panel-header"><div class="mem-panel-title">📋 楼层管理</div><button class="mem-panel-close" id="memCloseFloor">×</button></div>
@@ -822,8 +704,31 @@ function buildPanelsHTML() {
   <div class="mem-panel">
     <div class="mem-panel-header"><div class="mem-panel-title">📖 使用说明</div><button class="mem-panel-close" id="memCloseHelp">×</button></div>
     <div class="mem-help-content">
-      <div class="mem-help-section"><div class="mem-help-section-title">🎯 功能</div><div class="mem-help-section-content"><ul><li><b>存档管理</b>：创建、切换、复制</li><li><b>写入世界书</b>：从AI总结解析写入</li><li><b>楼层管理</b>：提取剧情提示、隐藏历史</li></ul></div></div>
-      <div class="mem-help-section"><div class="mem-help-section-title">📝 流程</div><div class="mem-help-section-content"><ol><li>📚 创建世界书</li><li>🔄 解析或 ✍️ 分别写入</li><li>📋 隐藏历史+提取剧情提示</li><li>⚙️ 快捷切换存档</li></ol><p>💡 悬浮球可<b>拖拽</b>，拖到边缘自动收起</p><p>🔍 刷新会自动检测你在酒馆全局世界书面板里激活的世界书</p></div></div>
+      <div class="mem-help-section"><div class="mem-help-section-title">🎯 功能</div><div class="mem-help-section-content"><ul>
+        <li><b>存档管理</b>：创建、切换、复制回忆世界书</li>
+        <li><b>📝 总结指令</b>：一键发送大总结/二次压缩指令</li>
+        <li><b>🔄 解析写入</b>：AI回复后解析总结并写入世界书</li>
+        <li><b>楼层管理</b>：提取剧情提示、隐藏历史消息</li>
+      </ul></div></div>
+      <div class="mem-help-section"><div class="mem-help-section-title">📝 使用流程</div><div class="mem-help-section-content"><ol>
+        <li>📚 创建世界书</li>
+        <li>📝 发送总结指令（大总结或二次总结）</li>
+        <li>等待AI回复完成</li>
+        <li>🔄 点击解析写入，自动写入世界书</li>
+        <li>📋 楼层管理 → 隐藏历史 + 提取剧情提示</li>
+        <li>继续角色扮演！</li>
+      </ol>
+      <p>💡 悬浮球可<b>拖拽</b>，拖到边缘自动收起</p>
+      <p>🔍 刷新会自动检测你在酒馆全局世界书面板里激活的世界书</p>
+      </div></div>
+      <div class="mem-help-section"><div class="mem-help-section-title">🗜️ 二次总结说明</div><div class="mem-help-section-content">
+        <p>当总结内容过长消耗太多token时，使用二次总结进行深度压缩：</p>
+        <ul>
+          <li>回忆部分去除主观感受，只保留事件因果链</li>
+          <li>无法压缩的内容改写为英文或文言文节约token</li>
+          <li>合并同类事件，删除冗余描述</li>
+        </ul>
+      </div></div>
       <div class="mem-warning-box"><div class="mem-warning-box-title">🚨 警告</div><div class="mem-warning-box-content">此为福利群特供，请勿二传二改！</div></div>
       <div class="mem-author-box"><div class="mem-author-name">👤 金瓜瓜</div><div class="mem-author-contact">📧 gua.guagua.uk 💬 QQ: 787849315</div><div class="mem-author-warning">🎁 举报二传可获至少10元API额度！</div></div>
     </div>
@@ -899,9 +804,9 @@ async function refreshPanelData() {
   const bookName = manager.lorebookName;
   const display = manager.getDisplayName();
   const el1 = document.getElementById('memPanelBookName');
-  const el2 = document.getElementById('memWriteTarget');
+  const el2 = document.getElementById('memSummaryTarget'); // ★ 改为总结面板的目标显示
   if (el1) el1.textContent = bookName ? display : '⚠️ 未绑定';
-  if (el2) el2.textContent = bookName || '请先刷新';
+  if (el2) el2.textContent = bookName ? display : '⚠️ 请先创建世界书';
   updateSettingsBook(bookName || '无');
   updateSettingsChar(manager.charName || '无');
 
@@ -911,22 +816,18 @@ async function refreshPanelData() {
   if (!container) return;
   if (!books.length) { container.innerHTML = '<div class="mem-book-item" style="color:#888">暂无</div>'; return; }
 
-  // ★ 同时获取激活列表，用于在 UI 中标记哪些是激活的
   const activeWorlds = await ST.getActiveWorldBooks();
   const baseName = manager.charName ? `${manager.charName}${CONFIG.LOREBOOK_SUFFIX}` : null;
 
   container.innerHTML = books.map((b, i) => {
     const cur = b === manager.lorebookName;
     const main = baseName && b === baseName;
-    const active = activeWorlds.includes(b);  // ★ 是否在酒馆中已激活
+    const active = activeWorlds.includes(b);
     let badge = '';
     if (cur && main) badge = '<span class="mem-book-badge">当前·主线</span>';
     else if (cur) badge = '<span class="mem-book-badge">当前</span>';
     else if (main) badge = '<span class="mem-book-badge" style="background:#27ae60">主线</span>';
-
-    // ★ 额外标记：如果在酒馆中已激活但不是当前选择的，提示用户
     if (active && !cur) badge += '<span class="mem-book-badge" style="background:#e67e22;margin-left:4px">已激活</span>';
-
     return `<div class="mem-book-item ${cur ? 'mem-current' : ''}" data-bi="${i}"><span>${escHTML(b)}</span><div>${badge}</div></div>`;
   }).join('');
 
@@ -961,14 +862,33 @@ function bindEvents(fabRoot, dragDock) {
     uiState.menuOpen = false; fabRoot.classList.remove('mem-active');
     $('#memFabOverlay').classList.remove('mem-visible');
     $(`#${id}`)?.classList.add('mem-active');
-    if (id === 'memSettingsPanel' || id === 'memWritePanel') refreshPanelData();
+    if (id === 'memSettingsPanel' || id === 'memSummaryPanel') refreshPanelData(); // ★ 总结面板也刷新
   };
 
   $('#memCloseSettings')?.addEventListener('click', () => closePanel('memSettingsPanel'));
-  $('#memCloseWrite')?.addEventListener('click', () => closePanel('memWritePanel'));
+  $('#memCloseSummary')?.addEventListener('click', () => closePanel('memSummaryPanel')); // ★ 新
   $('#memCloseFloor')?.addEventListener('click', () => closePanel('memFloorPanel'));
   $('#memCloseHelp')?.addEventListener('click', () => closePanel('memHelpPanel'));
   $$('.mem-panel-overlay').forEach(ov => { ov.addEventListener('click', e => { if (e.target === ov) ov.classList.remove('mem-active'); }); });
+
+  // ★★★ 总结指令按钮绑定 ★★★
+  $('#memSummaryFull')?.addEventListener('click', async () => {
+    if (uiState.processing) return;
+    setProcessing(true);
+    try {
+      await sendSummaryCommand('full');
+      closePanel('memSummaryPanel');
+    } finally { setProcessing(false); }
+  });
+
+  $('#memSummaryCompress')?.addEventListener('click', async () => {
+    if (uiState.processing) return;
+    setProcessing(true);
+    try {
+      await sendSummaryCommand('compress');
+      closePanel('memSummaryPanel');
+    } finally { setProcessing(false); }
+  });
 
   $$('.mem-fab-menu-item').forEach(item => {
     item.addEventListener('pointerup', async e => {
@@ -977,7 +897,7 @@ function bindEvents(fabRoot, dragDock) {
       const action = item.dataset.action;
       switch (action) {
         case 'open_settings': openPanel('memSettingsPanel'); break;
-        case 'open_write': openPanel('memWritePanel'); break;
+        case 'open_summary': openPanel('memSummaryPanel'); break; // ★ 改
         case 'open_floor': openPanel('memFloorPanel'); break;
         case 'open_help': openPanel('memHelpPanel'); break;
         case 'parse_all':
@@ -1002,6 +922,7 @@ function bindEvents(fabRoot, dragDock) {
     });
   });
 
+  // 设置面板按钮
   $('#memRefreshBooks')?.addEventListener('click', async () => {
     setProcessing(true);
     try { await manager.init(true); await refreshPanelData(); }
@@ -1021,20 +942,8 @@ function bindEvents(fabRoot, dragDock) {
     try { await manager.copyTo(v); $('#memCopySuffix').value = ''; await refreshPanelData(); }
     finally { setProcessing(false); }
   });
-  $('#memWriteRefresh')?.addEventListener('click', async () => {
-    setProcessing(true);
-    try { await manager.init(true); await refreshPanelData(); }
-    finally { setProcessing(false); }
-  });
-  $('#memWriteSwitch')?.addEventListener('click', () => { closePanel('memWritePanel'); openPanel('memSettingsPanel'); });
-  $$('.mem-write-btn').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      if (uiState.processing) return;
-      setProcessing(true);
-      try { const a = btn.dataset.parse; if (a === 'parse_summary') await parseFull(); else await parseSingle(a); }
-      finally { setProcessing(false); }
-    });
-  });
+
+  // 楼层管理
   $$('.mem-hide-option').forEach(opt => {
     opt.addEventListener('click', async () => {
       if (uiState.processing) return;
@@ -1089,7 +998,7 @@ function bindSettingsPanel() {
 
 // ==================== 主初始化 ====================
 jQuery(async () => {
-  console.log('[回忆管理器] v2.8.0 初始化...');
+  console.log('[回忆管理器] v2.9.0 初始化...');
   if (!extension_settings[MODULE_NAME]) extension_settings[MODULE_NAME] = {};
   const settings = extension_settings[MODULE_NAME];
   for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) { if (settings[k] === undefined) settings[k] = v; }
@@ -1129,5 +1038,5 @@ jQuery(async () => {
 
   window._memoryManager = manager;
   window._floorManager = floorMgr;
-  console.log('[回忆管理器] ✅ v2.8.0 就绪');
+  console.log('[回忆管理器] ✅ v2.9.0 就绪');
 });
