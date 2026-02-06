@@ -861,9 +861,19 @@ function bindEvents(fabRoot, dragDock) {
   const openPanel = id => {
     uiState.menuOpen = false; fabRoot.classList.remove('mem-active');
     $('#memFabOverlay').classList.remove('mem-visible');
-    $(`#${id}`)?.classList.add('mem-active');
-    if (id === 'memSettingsPanel' || id === 'memSummaryPanel') refreshPanelData(); // ★ 总结面板也刷新
+    const panel = $(`#${id}`);
+    if (panel) {
+      panel.classList.add('mem-active');
+      // ★ 修复2：防幽灵点击 —— 面板打开后 400ms 内禁止交互
+      const inner = panel.querySelector('.mem-panel');
+      if (inner) {
+        inner.style.pointerEvents = 'none';
+        setTimeout(() => { inner.style.pointerEvents = ''; }, 400);
+      }
+    }
+    if (id === 'memSettingsPanel' || id === 'memSummaryPanel') refreshPanelData();
   };
+
 
   $('#memCloseSettings')?.addEventListener('click', () => closePanel('memSettingsPanel'));
   $('#memCloseSummary')?.addEventListener('click', () => closePanel('memSummaryPanel')); // ★ 新
@@ -893,7 +903,9 @@ function bindEvents(fabRoot, dragDock) {
   $$('.mem-fab-menu-item').forEach(item => {
     item.addEventListener('pointerup', async e => {
       e.stopPropagation();
+      e.preventDefault();
       if (uiState.processing) return;
+
       const action = item.dataset.action;
       switch (action) {
         case 'open_settings': openPanel('memSettingsPanel'); break;
