@@ -1,0 +1,64 @@
+<div class="memory-manager-settings">
+  <div class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+      <b>回忆世界书管理器</b>
+      <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+
+      <!-- 启用开关 -->
+      <div class="flex-container flexFlowColumn">
+        <label class="checkbox_label flexNoGap" for="mem_mgr_enabled">
+          <input id="mem_mgr_enabled" type="checkbox" checked />
+          <span data-i18n="启用插件">启用插件（显示悬浮球）</span>
+        </label>
+      </div>
+
+      <hr />
+
+      <!-- 调试模式 -->
+      <div class="flex-container flexFlowColumn">
+        <label class="checkbox_label flexNoGap" for="mem_mgr_debug">
+          <input id="mem_mgr_debug" type="checkbox" />
+          <span>调试模式（在控制台输出日志）</span>
+        </label>
+      </div>
+
+      <hr />
+
+      <!-- 状态信息 -->
+      <div class="flex-container flexFlowColumn">
+        <small>插件状态</small>
+        <div id="mem_mgr_status" style="
+          padding: 10px;
+          margin-top: 6px;
+          background: var(--SmartThemeBlurTintColor);
+          border-radius: 8px;
+          font-size: 13px;
+          line-height: 1.6;
+        ">
+          <div>📌 状态: <span id="mem_mgr_status_text" style="color: var(--SmartThemeQuoteColor);">等待初始化...</span></div>
+          <div>📖 当前世界书: <span id="mem_mgr_current_book">无</span></div>
+          <div>👤 当前角色: <span id="mem_mgr_current_char">无</span></div>
+        </div>
+      </div>
+
+      <hr />
+
+      <!-- 重置位置 -->
+      <div class="flex-container">
+        <div id="mem_mgr_reset_pos" class="menu_button menu_button_icon">
+          <i class="fa-solid fa-crosshairs"></i>
+          <span>重置悬浮球位置</span>
+        </div>
+      </div>
+
+      <hr />
+
+      <div style="font-size: 12px; color: var(--SmartThemeChatFontColor); opacity: 0.5; margin-top: 8px;">
+        回忆世界书管理器 v2.4.0 by 金瓜瓜
+      </div>
+
+    </div>
+  </div>
+</div>

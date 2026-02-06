@@ -1,0 +1,12 @@
+{
+  "display_name": "回忆世界书管理器",
+  "loading_order": 10,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "金瓜瓜",
+  "version": "2.4.0",
+  "homePage": "",
+  "auto_update": false
+}

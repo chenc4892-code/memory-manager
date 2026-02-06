@@ -1,0 +1,778 @@
+/* ==================== 回忆管理器 - 悬浮球 & 面板 ==================== */
+
+/* ===== 悬浮球主容器 ===== */
+#mem-fab-root {
+  position: fixed;
+  z-index: 99999;
+  transition: opacity 0.3s, transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#mem-fab-root.mem-hidden {
+  display: none !important;
+}
+
+/* ===== 停靠状态 ===== */
+#mem-fab-root.mem-docked-left {
+  transform: translateX(-68px);
+}
+
+#mem-fab-root.mem-docked-right {
+  transform: translateX(68px);
+}
+
+#mem-fab-root.mem-docked-left:hover,
+#mem-fab-root.mem-docked-right:hover {
+  transform: translateX(0);
+}
+
+/* ===== 停靠拉手 ===== */
+.mem-dock-handle {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 56px;
+  background: linear-gradient(135deg, rgba(102, 126, 234, 0.85), rgba(118, 75, 162, 0.85));
+  border-radius: 0 12px 12px 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: white;
+  font-size: 14px;
+  font-weight: bold;
+  box-shadow: 2px 2px 10px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(8px);
+  animation: mem-handle-pulse 2s infinite;
+}
+
+#mem-fab-root.mem-docked-left .mem-dock-handle {
+  right: -24px;
+  display: flex;
+  border-radius: 0 12px 12px 0;
+}
+
+#mem-fab-root.mem-docked-right .mem-dock-handle {
+  left: -24px;
+  display: flex;
+  border-radius: 12px 0 0 12px;
+}
+
+@keyframes mem-handle-pulse {
+
+  0%,
+  100% {
+    opacity: 0.7;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ===== 主按钮 ===== */
+.mem-fab-main {
+  width: 80px;
+  height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  border-radius: 50%;
+}
+
+.mem-fab-main:active {
+  transform: scale(0.92);
+}
+
+.mem-fab-icon {
+  width: 80px;
+  height: 80px;
+  background: url('https://img.nagadnd.club/i/2026/01/19/syrzem.png') center/contain no-repeat;
+  transition: transform 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.2));
+  pointer-events: none;
+}
+
+#mem-fab-root.mem-active .mem-fab-icon {
+  transform: rotate(360deg);
+}
+
+.mem-fab-main.mem-processing .mem-fab-icon {
+  animation: mem-rotate 2s linear infinite;
+}
+
+@keyframes mem-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ===== 子菜单 ===== */
+.mem-fab-menu {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.mem-fab-menu-item {
+  position: absolute;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.95), rgba(240, 240, 240, 0.95));
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transform: translate(-50%, -50%) scale(0);
+  transition: all 0.4s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+  pointer-events: none;
+  font-size: 22px;
+  left: 50%;
+  top: 50%;
+  backdrop-filter: blur(10px);
+}
+
+#mem-fab-root.mem-active .mem-fab-menu-item {
+  opacity: 1;
+  pointer-events: all;
+}
+
+/* 6个按钮位置 */
+#mem-fab-root.mem-active .mem-fab-menu-item:nth-child(1) {
+  transform: translate(-50%, -50%) scale(1) translate(0, -105px);
+  transition-delay: 0.05s;
+}
+
+#mem-fab-root.mem-active .mem-fab-menu-item:nth-child(2) {
+  transform: translate(-50%, -50%) scale(1) translate(91px, -52px);
+  transition-delay: 0.1s;
+}
+
+#mem-fab-root.mem-active .mem-fab-menu-item:nth-child(3) {
+  transform: translate(-50%, -50%) scale(1) translate(91px, 52px);
+  transition-delay: 0.15s;
+}
+
+#mem-fab-root.mem-active .mem-fab-menu-item:nth-child(4) {
+  transform: translate(-50%, -50%) scale(1) translate(0, 105px);
+  transition-delay: 0.2s;
+}
+
+#mem-fab-root.mem-active .mem-fab-menu-item:nth-child(5) {
+  transform: translate(-50%, -50%) scale(1) translate(-91px, 52px);
+  transition-delay: 0.25s;
+}
+
+#mem-fab-root.mem-active .mem-fab-menu-item:nth-child(6) {
+  transform: translate(-50%, -50%) scale(1) translate(-91px, -52px);
+  transition-delay: 0.3s;
+}
+
+.mem-fab-menu-item:hover {
+  background: linear-gradient(145deg, #fff, #f5f5f5);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15), inset 0 1px 0 #fff;
+}
+
+/* 工具提示 */
+.mem-fab-tooltip {
+  position: absolute;
+  bottom: -34px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(30, 30, 40, 0.92);
+  color: #fff;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.2s;
+  backdrop-filter: blur(8px);
+}
+
+.mem-fab-menu-item:hover .mem-fab-tooltip {
+  opacity: 1;
+  bottom: -38px;
+}
+
+/* ===== 遮罩 ===== */
+.mem-fab-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(2px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s;
+  z-index: 99998;
+}
+
+.mem-fab-overlay.mem-visible {
+  opacity: 1;
+  pointer-events: all;
+}
+
+/* ===== 面板通用 ===== */
+.mem-panel-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(8px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.3s;
+  z-index: 100000;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.mem-panel-overlay.mem-active {
+  opacity: 1;
+  pointer-events: all;
+}
+
+.mem-panel {
+  background: linear-gradient(180deg, #ffffff 0%, #f8f9fa 100%);
+  border-radius: 24px;
+  padding: 28px;
+  width: 460px;
+  max-width: 92vw;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 25px 80px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  transform: scale(0.9) translateY(20px);
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  color: #333;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.mem-panel-overlay.mem-active .mem-panel {
+  transform: scale(1) translateY(0);
+}
+
+.mem-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.mem-panel::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+
+.mem-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 22px;
+  padding-bottom: 14px;
+  background: linear-gradient(90deg, transparent, rgba(102, 126, 234, 0.1), transparent);
+  margin-left: -28px;
+  margin-right: -28px;
+  padding-left: 28px;
+  padding-right: 28px;
+}
+
+.mem-panel-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #1a1a2e;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mem-panel-close {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.05);
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: #666;
+  transition: all 0.2s;
+}
+
+.mem-panel-close:hover {
+  background: linear-gradient(135deg, #ff6b6b, #ee5a5a);
+  color: #fff;
+  transform: rotate(90deg);
+}
+
+/* 信息卡片 */
+.mem-info-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #fff;
+  padding: 18px 22px;
+  border-radius: 16px;
+  margin-bottom: 22px;
+  box-shadow: 0 8px 25px rgba(102, 126, 234, 0.3);
+}
+
+.mem-info-label {
+  font-size: 11px;
+  opacity: 0.8;
+  margin-bottom: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.mem-info-value {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* 列表 */
+.mem-list-title {
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mem-book-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 12px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.mem-book-item:hover {
+  background: rgba(102, 126, 234, 0.08);
+  transform: translateX(4px);
+}
+
+.mem-book-item.mem-current {
+  background: rgba(102, 126, 234, 0.12);
+  box-shadow: inset 0 0 0 2px rgba(102, 126, 234, 0.3);
+}
+
+.mem-book-badge {
+  font-size: 10px;
+  padding: 3px 9px;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: #fff;
+  border-radius: 16px;
+  font-weight: 600;
+}
+
+/* 按钮 */
+.mem-btn {
+  padding: 14px 16px;
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  font-family: inherit;
+}
+
+.mem-btn-primary {
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: #fff;
+  box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+}
+
+.mem-btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+}
+
+.mem-btn-secondary {
+  background: rgba(100, 100, 120, 0.1);
+  color: #333;
+}
+
+.mem-btn-secondary:hover {
+  background: rgba(100, 100, 120, 0.2);
+  transform: translateY(-1px);
+}
+
+.mem-btn-warning {
+  background: linear-gradient(135deg, #f093fb, #f5576c);
+  color: #fff;
+  box-shadow: 0 4px 15px rgba(245, 87, 108, 0.3);
+}
+
+.mem-btn-warning:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px rgba(245, 87, 108, 0.4);
+}
+
+.mem-btn-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.mem-btn-grid .mem-btn-full {
+  grid-column: span 2;
+}
+
+/* 输入框 */
+.mem-input {
+  width: 100%;
+  padding: 12px 16px;
+  background: rgba(0, 0, 0, 0.03);
+  border: 2px solid transparent;
+  border-radius: 10px;
+  font-size: 13px;
+  transition: all 0.2s;
+  box-sizing: border-box;
+  font-family: inherit;
+  color: #333;
+}
+
+.mem-input:focus {
+  outline: none;
+  background: #fff;
+  border-color: rgba(102, 126, 234, 0.5);
+  box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+.mem-input-label {
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 6px;
+  display: block;
+}
+
+/* 分组 */
+.mem-group {
+  margin-bottom: 22px;
+}
+
+.mem-group-title {
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mem-divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(0, 0, 0, 0.1), transparent);
+  margin: 22px 0;
+}
+
+/* 写入按钮网格 */
+.mem-write-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.mem-write-btn {
+  padding: 16px 10px;
+  border: none;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.02);
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  font-family: inherit;
+}
+
+.mem-write-btn:hover {
+  background: rgba(102, 126, 234, 0.1);
+  transform: translateY(-3px);
+  box-shadow: 0 6px 16px rgba(102, 126, 234, 0.12);
+}
+
+.mem-write-btn-icon {
+  font-size: 26px;
+}
+
+.mem-write-btn-text {
+  font-size: 11px;
+  color: #555;
+  font-weight: 500;
+}
+
+/* 隐藏选项 */
+.mem-hide-option {
+  padding: 14px 16px;
+  background: rgba(0, 0, 0, 0.02);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  margin-bottom: 8px;
+}
+
+.mem-hide-option:hover {
+  background: rgba(102, 126, 234, 0.08);
+  transform: translateX(3px);
+}
+
+.mem-hide-option-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+.mem-hide-option-desc {
+  font-size: 11px;
+  color: #999;
+}
+
+/* 选项卡 */
+.mem-option-card {
+  background: rgba(0, 0, 0, 0.02);
+  padding: 12px 14px;
+  border-radius: 10px;
+  margin-bottom: 8px;
+}
+
+.mem-option-card label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #333;
+}
+
+.mem-option-card input[type="checkbox"],
+.mem-option-card input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  accent-color: #667eea;
+}
+
+.mem-send-mode-group {
+  background: rgba(102, 126, 234, 0.05);
+  padding: 12px 14px;
+  border-radius: 10px;
+  margin-bottom: 12px;
+}
+
+.mem-send-mode-title {
+  font-size: 11px;
+  color: #888;
+  margin-bottom: 8px;
+}
+
+.mem-send-mode-options {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.mem-send-mode-options label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  color: #444;
+}
+
+/* 帮助面板 */
+.mem-help-content {
+  line-height: 1.8;
+  color: #444;
+}
+
+.mem-help-section {
+  margin-bottom: 22px;
+}
+
+.mem-help-section-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #1a1a2e;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mem-help-section-content {
+  font-size: 13px;
+  padding-left: 6px;
+}
+
+.mem-help-section-content p {
+  margin: 6px 0;
+}
+
+.mem-help-section-content ul,
+.mem-help-section-content ol {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.mem-help-section-content li {
+  margin: 4px 0;
+}
+
+.mem-warning-box {
+  background: rgba(255, 107, 107, 0.1);
+  padding: 14px 18px;
+  border-radius: 12px;
+  margin: 14px 0;
+}
+
+.mem-warning-box-title {
+  font-weight: 700;
+  color: #e74c3c;
+  margin-bottom: 6px;
+}
+
+.mem-warning-box-content {
+  font-size: 12px;
+  color: #c0392b;
+}
+
+.mem-author-box {
+  background: rgba(102, 126, 234, 0.1);
+  padding: 18px 22px;
+  border-radius: 14px;
+  margin-top: 18px;
+  text-align: center;
+}
+
+.mem-author-name {
+  font-size: 15px;
+  font-weight: 700;
+  color: #667eea;
+  margin-bottom: 6px;
+}
+
+.mem-author-contact {
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 10px;
+}
+
+.mem-author-warning {
+  font-size: 11px;
+  color: #e74c3c;
+  font-weight: 600;
+  padding: 8px 14px;
+  background: rgba(231, 76, 60, 0.1);
+  border-radius: 8px;
+  margin-top: 10px;
+}
+
+/* 拖拽状态 */
+#mem-fab-root.mem-dragging {
+  transition: none !important;
+  opacity: 0.85;
+}
+
+#mem-fab-root.mem-dragging * {
+  pointer-events: none !important;
+}
+
+/* 移动端 */
+@media (max-width: 768px) {
+
+  .mem-fab-main,
+  .mem-fab-icon {
+    width: 64px;
+    height: 64px;
+  }
+
+  .mem-fab-menu-item {
+    width: 44px;
+    height: 44px;
+    font-size: 18px;
+  }
+
+  #mem-fab-root.mem-active .mem-fab-menu-item:nth-child(1) {
+    transform: translate(-50%, -50%) scale(1) translate(0, -88px);
+  }
+
+  #mem-fab-root.mem-active .mem-fab-menu-item:nth-child(2) {
+    transform: translate(-50%, -50%) scale(1) translate(76px, -44px);
+  }
+
+  #mem-fab-root.mem-active .mem-fab-menu-item:nth-child(3) {
+    transform: translate(-50%, -50%) scale(1) translate(76px, 44px);
+  }
+
+  #mem-fab-root.mem-active .mem-fab-menu-item:nth-child(4) {
+    transform: translate(-50%, -50%) scale(1) translate(0, 88px);
+  }
+
+  #mem-fab-root.mem-active .mem-fab-menu-item:nth-child(5) {
+    transform: translate(-50%, -50%) scale(1) translate(-76px, 44px);
+  }
+
+  #mem-fab-root.mem-active .mem-fab-menu-item:nth-child(6) {
+    transform: translate(-50%, -50%) scale(1) translate(-76px, -44px);
+  }
+
+  .mem-panel {
+    padding: 20px;
+    max-width: 95vw;
+    border-radius: 18px;
+  }
+
+  .mem-btn-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mem-btn-grid .mem-btn-full {
+    grid-column: span 1;
+  }
+
+  .mem-write-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
