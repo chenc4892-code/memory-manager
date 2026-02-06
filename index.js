@@ -850,44 +850,45 @@ function setProcessing(v) {
 }
 
 // ==================== 事件绑定 ====================
+// ==================== 事件绑定 ====================
 function bindEvents(fabRoot, dragDock) {
   const $ = s => document.querySelector(s);
   const $$ = s => document.querySelectorAll(s);
-  let lastPanelOpenTime = 0;
+
+  // ★ 修复2：面板刚打开的防抖标记
+  let panelJustOpened = false;
+
   fabRoot.querySelector('.mem-dock-handle').addEventListener('click', e => { e.stopPropagation(); dragDock.undock(); });
   fabRoot.querySelector('.mem-dock-handle').addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation(); dragDock.undock(); });
   $('#memFabOverlay').addEventListener('click', () => { uiState.menuOpen = false; fabRoot.classList.remove('mem-active'); $('#memFabOverlay').classList.remove('mem-visible'); });
 
   const closePanel = id => $(`#${id}`)?.classList.remove('mem-active');
   const openPanel = id => {
-    lastPanelOpenTime = Date.now();
     uiState.menuOpen = false; fabRoot.classList.remove('mem-active');
     $('#memFabOverlay').classList.remove('mem-visible');
-    const panel = $(`#${id}`);
-    if (panel) {
-      panel.classList.add('mem-active');
-      // ★ 修复2：防幽灵点击 —— 面板打开后 400ms 内禁止交互
-      const inner = panel.querySelector('.mem-panel');
-      if (inner) {
-        inner.style.pointerEvents = 'none';
-        setTimeout(() => { inner.style.pointerEvents = ''; }, 400);
-      }
-    }
+
+    // ★ 修复2：设置防抖，阻止 pointerup → click 穿透
+    panelJustOpened = true;
+    setTimeout(() => { panelJustOpened = false; }, 400);
+
+    $(`#${id}`)?.classList.add('mem-active');
     if (id === 'memSettingsPanel' || id === 'memSummaryPanel') refreshPanelData();
   };
 
-
   $('#memCloseSettings')?.addEventListener('click', () => closePanel('memSettingsPanel'));
-  $('#memCloseSummary')?.addEventListener('click', () => closePanel('memSummaryPanel')); // ★ 新
+  $('#memCloseSummary')?.addEventListener('click', () => closePanel('memSummaryPanel'));
   $('#memCloseFloor')?.addEventListener('click', () => closePanel('memFloorPanel'));
   $('#memCloseHelp')?.addEventListener('click', () => closePanel('memHelpPanel'));
   $$('.mem-panel-overlay').forEach(ov => { ov.addEventListener('click', e => { if (e.target === ov) ov.classList.remove('mem-active'); }); });
 
-  // ★★★ 总结指令按钮绑定 ★★★
-  // ★★★ 总结指令按钮绑定 ★★★
-  $('#memSummaryFull')?.addEventListener('click', async () => {
-    if (uiState.processing) return;
-    if (Date.now() - lastPanelOpenTime < 500) return;  // ★ 防幽灵点击
+  // ★★★ 修复2：总结指令按钮加防抖检查 ★★★
+  $('#memSummaryFull')?.addEventListener('click', async (e) => {
+    // ★ 面板刚打开时忽略这次点击（是穿透过来的）
+    if (uiState.processing || panelJustOpened) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     setProcessing(true);
     try {
       await sendSummaryCommand('full');
@@ -895,9 +896,13 @@ function bindEvents(fabRoot, dragDock) {
     } finally { setProcessing(false); }
   });
 
-  $('#memSummaryCompress')?.addEventListener('click', async () => {
-    if (uiState.processing) return;
-    if (Date.now() - lastPanelOpenTime < 500) return;  // ★ 防幽灵点击
+  $('#memSummaryCompress')?.addEventListener('click', async (e) => {
+    // ★ 面板刚打开时忽略这次点击
+    if (uiState.processing || panelJustOpened) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     setProcessing(true);
     try {
       await sendSummaryCommand('compress');
@@ -905,17 +910,16 @@ function bindEvents(fabRoot, dragDock) {
     } finally { setProcessing(false); }
   });
 
-
   $$('.mem-fab-menu-item').forEach(item => {
     item.addEventListener('pointerup', async e => {
       e.stopPropagation();
+      // ★ 修复2：阻止后续 click 事件冒泡穿透
       e.preventDefault();
       if (uiState.processing) return;
-
       const action = item.dataset.action;
       switch (action) {
         case 'open_settings': openPanel('memSettingsPanel'); break;
-        case 'open_summary': openPanel('memSummaryPanel'); break; // ★ 改
+        case 'open_summary': openPanel('memSummaryPanel'); break;
         case 'open_floor': openPanel('memFloorPanel'); break;
         case 'open_help': openPanel('memHelpPanel'); break;
         case 'parse_all':
@@ -986,6 +990,7 @@ function bindEvents(fabRoot, dragDock) {
     finally { setProcessing(false); }
   });
 }
+
 
 // ==================== Settings 面板 ====================
 function bindSettingsPanel() {
