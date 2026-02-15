@@ -1,1065 +1,4185 @@
-// ==================== 回忆世界书管理器 v2.9.0 (SillyTavern Extension) ====================
-// v2.9.0:
-// - ★ 新增：总结指令面板（替换写入面板）
-// - ★ 大总结 / 二次总结 一键发送
-// - 保留 🔄 解析全部按钮用于手动写入世界书
-import { extension_settings, getContext } from '../../../extensions.js';
-import { saveSettingsDebounced, getRequestHeaders } from '../../../../script.js';
+/**
+ * Memory Manager v5.0 — PageIndex + Embedding + MemGPT Agent
+ *
+ * Three-layer memory system with semantic retrieval:
+ *   Layer 1: Story Index (always injected, compact ~400-600 tokens, bounded)
+ *   Layer 2: Story Pages (retrieved on demand via embedding + agent)
+ *   Layer 3: Character Dossiers (retrieved on demand)
+ *
+ * v5 additions over v4:
+ *   - Independent save system (memory persists across chats per character)
+ *   - Semantic category tags (emotional/relationship/intimate/promise/conflict/discovery/turning_point/daily)
+ *   - Embedding vector retrieval (direct browser fetch to 中转站 /v1/embeddings)
+ *   - Enhanced memory agent (6 tools, multi-round reasoning)
+ *   - Unified retrieval flow: embedding pre-filter → agent → keyword fallback
+ */
 
-const MODULE_NAME = 'memory-manager';
-const EXTENSION_PATH = `scripts/extensions/third-party/${MODULE_NAME}`;
+import {
+    eventSource,
+    event_types,
+    generateQuietPrompt,
+    getRequestHeaders,
+    setExtensionPrompt,
+    extension_prompt_types,
+    extension_prompt_roles,
+    saveSettingsDebounced,
+    substituteParams,
+    is_send_press,
+} from '../../../../script.js';
 
-// ==================== 默认设置 ====================
+import {
+    extension_settings,
+    getContext,
+    saveMetadataDebounced,
+} from '../../../extensions.js';
+
+import {
+    hideChatMessageRange,
+} from '../../../chats.js';
+
+import {
+    getSortedEntries,
+} from '../../../world-info.js';
+
+import { VALID_AUTH_HASHES } from './auth-hashes.js';
+
+// ============================================================
+//  Constants
+// ============================================================
+
+const MODULE_NAME = 'memory_manager';
+const LOG_PREFIX = '[MemMgr]';
+const PROMPT_KEY_INDEX = 'mm_story_index';
+const PROMPT_KEY_PAGES = 'mm_recalled_pages';
+const DATA_VERSION = 4;
+
+// Compression level constants
+const COMPRESS_FRESH = 0;      // Full detail, 100-300 chars
+const COMPRESS_SUMMARY = 1;    // Compressed, 30-80 chars
+const COMPRESS_ARCHIVED = 2;   // Merged into timeline, page deleted
+
+// Semantic category constants
+const MEMORY_CATEGORIES = {
+    emotional:      '情感',
+    relationship:   '关系',
+    intimate:       '亲密',
+    promise:        '承诺',
+    conflict:       '冲突',
+    discovery:      '发现',
+    turning_point:  '转折',
+    daily:          '日常',
+};
+const VALID_CATEGORIES = new Set(Object.keys(MEMORY_CATEGORIES));
+
+// Category color mapping (for UI)
+const CATEGORY_COLORS = {
+    emotional:      '#ec4899',
+    relationship:   '#f59e0b',
+    intimate:       '#ef4444',
+    promise:        '#8b5cf6',
+    conflict:       '#f97316',
+    discovery:      '#06b6d4',
+    turning_point:  '#22c55e',
+    daily:          '#6b7280',
+};
+
+// Lottie mood system
+const LOTTIE_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/lottie-web/5.12.2/lottie_light.min.js';
+const MOOD_FILES = {
+    idle: 'friendly-robot-animation_14079420.json',
+    thinking: 'wink-robot-animation_14079421.json',
+    joyful: 'joyful-robot-animation_14079418.json',
+    inlove: 'inlove-robot-animation_14079419.json',
+    angry: 'angry-robot-animation_14079422.json',
+    sad: 'sad-robot-animation_14079423.json',
+};
+let currentMood = 'idle';
+let lottieInstance = null;
+let moodResetTimer = null;
+
+// ============================================================
+//  Authorization (授权码验证)
+// ============================================================
+
+async function sha256(text) {
+    const data = new TextEncoder().encode(text);
+    const hash = await crypto.subtle.digest('SHA-256', data);
+    return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function isAuthorized() {
+    const s = extension_settings[MODULE_NAME];
+    if (!s) return false;
+    const h = s.authHash || '';
+    return VALID_AUTH_HASHES.has(h);
+}
+
+function showAuthScreen() {
+    $('#mm_auth_screen').show();
+    $('#mm_main_content').hide();
+}
+
+function hideAuthScreen() {
+    $('#mm_auth_screen').hide();
+    $('#mm_main_content').show();
+}
+
+function bindAuthUI() {
+    $('#mm_auth_submit').on('click', async () => {
+        const code = $('#mm_auth_input').val().trim();
+        if (!code) return;
+        const hash = await sha256(code);
+        if (VALID_AUTH_HASHES.has(hash)) {
+            // Save auth hash to settings
+            if (!extension_settings[MODULE_NAME]) extension_settings[MODULE_NAME] = {};
+            extension_settings[MODULE_NAME].authHash = hash;
+            saveSettingsDebounced();
+
+            // Unlock: full initialization
+            hideAuthScreen();
+            fullInitialize();
+            toastr.success('授权成功', 'MMPEA');
+        } else {
+            toastr.error('授权码无效', 'MMPEA');
+            $('#mm_auth_input').val('');
+        }
+    });
+
+    // Enter key support
+    $('#mm_auth_input').on('keydown', function (e) {
+        if (e.key === 'Enter') $('#mm_auth_submit').click();
+    });
+}
+
+// ============================================================
+//  Default Settings
+// ============================================================
+
 const DEFAULT_SETTINGS = {
-  enabled: true,
-  debug: false,
-  fabPosX: -1,
-  fabPosY: -1,
-  isDocked: false,
-  dockedSide: null,
-  lastUsedBooks: {},
+    enabled: true,
+    debug: false,
+    extractionInterval: 5,
+    extractionMaxTokens: 4096,
+    indexDepth: 9999,
+    recallDepth: 2,
+    maxPages: 3,
+    showRecallBadges: true,
+    // Compression (3 independent toggles)
+    compressTimeline: true,         // Compress timeline when entries exceed maxTimelineEntries
+    compressPages: false,           // Compress L0→L1 pages (old detailed → summary)
+    archiveDaily: false,            // Archive L2: delete daily-only pages when total > archiveThreshold
+    compressAfterPages: 15,         // Compress oldest L0 pages when total L0 > this
+    archiveThreshold: 50,           // Only archive daily pages when total pages > this
+    maxTimelineEntries: 20,         // Compress timeline when entries exceed this
+    // Auto-hide: hide processed messages to free context
+    autoHide: false,
+    keepRecentMessages: 10,
+    // Secondary API (副API) — OpenAI-compatible endpoint
+    useSecondaryApi: false,
+    secondaryApiUrl: '',
+    secondaryApiKey: '',
+    secondaryApiModel: '',
+    secondaryApiTemperature: 0.3,
+    // Known characters (from char card / world info, only track attitude, no full dossier)
+    knownCharacters: '',
+    // === v5 additions ===
+    // Independent save system
+    autoSaveSlot: true,
+    // Embedding vector retrieval
+    useEmbedding: false,
+    embeddingModel: 'text-embedding-3-large',
+    embeddingDimensions: 256,
+    embeddingTopK: 10,
+    embeddingApiUrl: '',        // Empty = reuse secondaryApiUrl
+    embeddingApiKey: '',        // Empty = reuse secondaryApiKey
 };
 
-// ==================== 配置 ====================
-const CONFIG = {
-  LOREBOOK_SUFFIX: '的回忆',
-  LOREBOOK_BRANCH_SEPARATOR: '-',
-  SUMMARY_TAG: 'Plot Summary',
-  OPERATION_DELAY: 300,
-  DOCK_THRESHOLD: 90,
-  POSITION_MAP: {
-    'before_character_definition': 0,
-    'after_character_definition': 1,
-    'before_example_messages': 2,
-    'after_example_messages': 3,
-    'at_depth_as_system': 4,
-    'at_depth_as_assistant': 5,
-    'at_depth_as_user': 6,
-  },
-  ENTRIES: {
-    'keyevents': { comment: 'keyevents', type: 'constant', position: 'at_depth_as_system', depth: 4, order: 100, content: '# 主要角色关键事件记录\n' },
-    '新增角色': { comment: '新增角色', type: 'constant', position: 'after_character_definition', order: 1001, content: '# 新增角色\n' },
-    '角色变化': { comment: '角色变化', type: 'constant', position: 'after_character_definition', order: 1002, content: '# 角色变化总结\n' },
-    '物品记录': { comment: '物品记录', type: 'constant', position: 'after_character_definition', order: 1003, content: '# 重要物品记录\n' },
-    '===开始===': { comment: '===开始===', type: 'constant', position: 'after_character_definition', order: 1004, content: '<memory>' },
-    '回忆': { comment: '回忆', type: 'constant', position: 'after_character_definition', order: 1005, content: '# 回忆\n' },
-    '===结束===': { comment: '===结束===', type: 'constant', position: 'after_character_definition', order: 1200, content: '</memory>' },
-  },
+// ============================================================
+//  Helpers
+// ============================================================
 
-  // ★ 新增：总结指令模板
-  SUMMARY_PROMPTS: {
-    full: `[OOC: 停止角色扮演。请从第一天开始，对到目前为止的所有剧情进行完整总结。
-    ]`,
-
-    compress: `[OOC: 停止角色扮演。请从第一天开始，对到目前为止的所有剧情进行二次压缩总结。
-
-**压缩原则（务必遵守）：**
-1. 对于「## 回忆」部分：尽量不要写入角色的主观感受。格外关注事件因果逻辑，尽可能不丢失事件因果链以及关键信息。
-2. 对于无法进一步压缩的已有 <memory> 内容：可以改写成英文或文言文来节约token。
-3. 合并同类事件，删除冗余描述和修饰性语句，只保留核心事实。
-]`,
-  },
-};
-
-// ==================== 工具 ====================
-function getSettings() { return extension_settings[MODULE_NAME]; }
-
-function log(msg, data = null) {
-  if (getSettings()?.debug) console.log(`[回忆管理器] ${msg}`, data ?? '');
+function log(...args) {
+    if (getSettings().debug) console.log(LOG_PREFIX, ...args);
 }
 
-function error(msg, err = null) {
-  console.error(`[回忆管理器] ${msg}`, err ?? '');
+function warn(...args) {
+    console.warn(LOG_PREFIX, ...args);
 }
 
-const wait = (ms) => new Promise(r => setTimeout(r, ms));
-
-function saveLastUsedBook(charName, bookName) {
-  const settings = getSettings();
-  if (!settings.lastUsedBooks) settings.lastUsedBooks = {};
-  settings.lastUsedBooks[charName] = bookName;
-  saveSettingsDebounced();
-  log(`已记住 ${charName} → ${bookName}`);
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
 }
 
-// ==================== world-info 模块缓存 ====================
-let _wiModule = null;
-
-async function getWiModule() {
-  if (_wiModule) return _wiModule;
-  const paths = [
-    '../../../world-info.js',
-    '../../world-info.js',
-    '../../../../scripts/world-info.js',
-  ];
-  for (const p of paths) {
-    try {
-      _wiModule = await import(p);
-      log('world-info 模块加载成功');
-      return _wiModule;
-    } catch { /* try next */ }
-  }
-  console.warn('[回忆管理器] world-info 模块所有路径都失败');
-  return null;
+function generateId(prefix = 'pg') {
+    return prefix + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
 }
 
-// ==================== SillyTavern API ====================
-const ST = {
-  getCharName() {
-    return getContext()?.name2 || '未知角色';
-  },
+// ============================================================
+//  Lottie Mood System
+// ============================================================
 
-  getChat() {
-    return getContext()?.chat || [];
-  },
+async function loadLottieLib() {
+    if (window.lottie) return;
+    return new Promise((resolve) => {
+        const script = document.createElement('script');
+        script.src = LOTTIE_CDN;
+        script.onload = resolve;
+        script.onerror = () => { warn('Failed to load Lottie library from CDN'); resolve(); };
+        document.head.appendChild(script);
+    });
+}
 
-  getLastMessage() {
-    const c = this.getChat();
-    return c.length > 0 ? c[c.length - 1] : null;
-  },
+/**
+ * Set the robot's mood animation.
+ * @param {string} mood - One of: idle, thinking, joyful, inlove, angry, sad
+ * @param {number} autoResetMs - If > 0, auto-reset to idle after this many ms
+ */
+function setMood(mood, autoResetMs = 0) {
+    if (!MOOD_FILES[mood] || !window.lottie) return;
+    if (mood === currentMood && lottieInstance) return;
 
-  getMessage(i) {
-    const c = this.getChat();
-    return (i >= 0 && i < c.length) ? c[i] : null;
-  },
+    currentMood = mood;
 
-  getLastMessageId() {
-    return Math.max(0, this.getChat().length - 1);
-  },
+    const container = document.getElementById('mm_lottie_container');
+    if (!container) return;
 
-  async execSlash(command) {
-    const ctx = getContext();
-    if (!ctx) throw new Error('context 不可用');
-    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
-      try {
-        const r = await ctx.executeSlashCommandsWithOptions(command, {
-          handleParserErrors: true, handleExecutionErrors: true,
-        });
-        return r?.pipe ?? '';
-      } catch (e) {
-        error(`slash: ${command.substring(0, 80)}`, e);
-        throw e;
-      }
+    if (lottieInstance) {
+        lottieInstance.destroy();
+        lottieInstance = null;
     }
-    if (typeof ctx.executeSlashCommands === 'function') {
-      const r = await ctx.executeSlashCommands(command);
-      return typeof r === 'string' ? r : '';
-    }
-    throw new Error('executeSlashCommands 不可用');
-  },
 
-  async toast(msg) {
-    try { await this.execSlash(`/echo ${msg}`); }
-    catch {
-      const el = document.getElementById('mem-toast-fallback');
-      if (el) { el.textContent = msg; el.style.display = 'block'; setTimeout(() => { el.style.display = 'none'; }, 3000); }
-    }
-  },
+    const baseUrl = new URL('.', import.meta.url).pathname;
+    lottieInstance = window.lottie.loadAnimation({
+        container,
+        renderer: 'svg',
+        loop: true,
+        autoplay: true,
+        path: `${baseUrl}lottie/${MOOD_FILES[mood]}`,
+    });
 
-  async getAllWorldNames() {
+    if (moodResetTimer) clearTimeout(moodResetTimer);
+    if (autoResetMs > 0) {
+        moodResetTimer = setTimeout(() => setMood('idle'), autoResetMs);
+    }
+}
+
+function toggleSecondaryApiFields(show) {
+    $('#mm_secondary_api_fields').toggle(show);
+}
+
+function toggleAutoHideFields(show) {
+    $('#mm_auto_hide_fields').toggle(show);
+}
+
+function toggleEmbeddingFields(show) {
+    $('#mm_embedding_fields').toggle(show);
+}
+
+// ============================================================
+//  Lore Context (仅世界书，不含角色卡)
+// ============================================================
+
+async function gatherWorldBookContext() {
+    // 只读取世界书条目（角色卡是角色设定，不是剧情记忆）
     try {
-      if (typeof window.world_names !== 'undefined' && Array.isArray(window.world_names) && window.world_names.length > 0) {
-        return [...window.world_names];
-      }
-    } catch { }
-    try {
-      const wi = await getWiModule();
-      if (wi?.world_names && Array.isArray(wi.world_names) && wi.world_names.length > 0) {
-        return [...wi.world_names];
-      }
-    } catch { }
-    for (const ep of ['/api/worldinfo', '/getworldnames']) {
-      try {
-        const r = await fetch(ep, { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({}) });
-        if (r.ok) {
-          const d = await r.json();
-          if (Array.isArray(d) && d.length > 0) return d;
-          if (d?.world_names) return d.world_names;
+        const entries = await getSortedEntries();
+        const activeEntries = entries?.filter(e => !e.disable && e.content?.trim());
+        if (!activeEntries || activeEntries.length === 0) return '';
+
+        // 按 position 分组，还原酒馆实际注入 prompt 时的区块顺序
+        // position: 0=↑Char(角色定义前), 1=↓Char(角色定义后),
+        //           2=↑AT, 3=↓AT, 4=@D(指定深度), 5=↑EM, 6=↓EM
+        const positionLabels = {
+            0: '角色定义前 (↑Char)',
+            1: '角色定义后 (↓Char)',
+            2: '作者注释顶部 (↑AT)',
+            3: '作者注释底部 (↓AT)',
+            4: '指定深度 (@D)',
+            5: '扩展提示顶部 (↑EM)',
+            6: '扩展提示底部 (↓EM)',
+        };
+        // 注入到 prompt 的实际顺序: 先角色定义前，再角色定义后，再其他
+        const positionOrder = [0, 1, 2, 3, 4, 5, 6];
+
+        const groups = new Map();
+        for (const entry of activeEntries) {
+            const pos = entry.position ?? 0;
+            if (!groups.has(pos)) groups.set(pos, []);
+            groups.get(pos).push(entry);
         }
-      } catch { }
-    }
-    return [];
-  },
 
-  async getActiveWorldBooks() {
-    log('正在检测已激活的世界书...');
-    try {
-      const wi = await getWiModule();
-      if (wi) {
-        const candidates = [wi.selected_world_info, wi.getActiveWorldNames?.(), wi.active_world];
-        for (const c of candidates) {
-          if (c) {
-            let result = null;
-            if (Array.isArray(c) && c.length > 0) result = [...c];
-            else if (c instanceof Set && c.size > 0) result = [...c];
-            else if (typeof c === 'string' && c.trim()) result = c.split(',').map(s => s.trim()).filter(Boolean);
-            if (result && result.length > 0) { log('检测到已激活世界书:', result); return result; }
-          }
+        const parts = [];
+        for (const pos of positionOrder) {
+            const group = groups.get(pos);
+            if (!group || group.length === 0) continue;
+
+            const label = positionLabels[pos] || `位置 ${pos}`;
+            parts.push(`=== ${label} ===`);
+            // 组内按 order 升序（order小的在上面，和 prompt 中的实际位置一致）
+            group.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+            for (const entry of group) {
+                const name = entry.comment || (entry.key || []).join('/') || '(无标题)';
+                parts.push(`【${name}】${entry.content}`);
+            }
         }
-      }
-    } catch (e) { log('方法1失败', e); }
-    try { if (typeof window.selected_world_info !== 'undefined') { const swi = window.selected_world_info; if (Array.isArray(swi) && swi.length > 0) return [...swi]; } } catch { }
-    try { if (typeof window.power_user !== 'undefined' && window.power_user?.world_info) { const wi = window.power_user.world_info; if (typeof wi === 'string' && wi.trim()) { const r = wi.split(',').map(s => s.trim()).filter(Boolean); if (r.length > 0) return r; } } } catch { }
-    try { const ctx = getContext(); if (ctx?.worldInfoActivated && Array.isArray(ctx.worldInfoActivated)) return [...ctx.worldInfoActivated]; } catch { }
-    log('所有方法都未检测到已激活世界书');
-    return [];
-  },
 
-  async createWorld(name) {
-    log(`创建世界书: "${name}"`);
-    try { const wi = await getWiModule(); if (wi?.createNewWorldInfo) { await wi.createNewWorldInfo(name); return true; } } catch (e) { log('模块创建失败', e); }
-    for (const ep of ['/api/worldinfo/create', '/createworldinfo']) {
-      try { const r = await fetch(ep, { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify({ name }) }); if (r.ok) return true; } catch { }
+        return parts.join('\n');
+    } catch (err) {
+        warn('Failed to load world info:', err);
+        return '';
     }
-    error(`创建失败: "${name}"`); return false;
-  },
-
-  async setWorldActive(name, active = true) {
-    try { await this.execSlash(active ? `/world ${name}` : `/world state=off silent=true ${name}`); return true; }
-    catch (e) { log(`激活 "${name}"=${active} 失败`, e); return false; }
-  },
-};
-
-// ==================== 操作队列 ====================
-class OperationQueue {
-  constructor() { this.queue = []; this.processing = false; this.currentOp = null; }
-  async enqueue(name, fn) {
-    return new Promise((resolve, reject) => {
-      log(`[队列] +${name} (等待=${this.queue.length})`);
-      this.queue.push({ name, fn, resolve, reject });
-      this._run();
-    });
-  }
-  async _run() {
-    if (this.processing || !this.queue.length) return;
-    this.processing = true;
-    const item = this.queue.shift();
-    this.currentOp = item.name;
-    try { const r = await item.fn(); await wait(CONFIG.OPERATION_DELAY); item.resolve(r); }
-    catch (e) { error(`[队列] ✗ ${item.name}`, e); item.reject(e); }
-    finally { this.processing = false; this.currentOp = null; if (this.queue.length) this._run(); }
-  }
 }
-const opQueue = new OperationQueue();
 
-// ==================== LorebookManager ====================
-class LorebookManager {
-  constructor() {
-    this.lorebookName = null;
-    this.charName = null;
-    this.entryUids = {};
-    this.initialized = false;
-  }
+// ============================================================
+//  Secondary API (副API) — OpenAI-compatible
+// ============================================================
 
-  async _findUid(bookName, comment) {
-    try { const r = await ST.execSlash(`/findentry file="${bookName}" field=comment ${comment}`); const t = r?.trim(); if (t && t !== '' && !isNaN(t)) return parseInt(t); } catch { }
-    return null;
-  }
+async function callLLM(systemPrompt, userPrompt, maxTokens = null) {
+    const s = getSettings();
 
-  async _createEntry(bookName, comment, content, config = {}) {
-    const entryConfig = CONFIG.ENTRIES[comment] || config;
-    const posNum = CONFIG.POSITION_MAP[entryConfig.position] ?? 1;
+    if (s.useSecondaryApi && s.secondaryApiUrl && s.secondaryApiKey) {
+        return await callSecondaryApi(systemPrompt, userPrompt, maxTokens);
+    }
+
+    // Fallback: use main API
+    log('Using main API (no secondary API configured)');
+    const fullPrompt = systemPrompt
+        ? `${systemPrompt}\n\n${userPrompt}`
+        : userPrompt;
+    return await generateQuietPrompt(fullPrompt, false, true, null, null, maxTokens || s.extractionMaxTokens);
+}
+
+async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
+    const s = getSettings();
+    const baseUrl = s.secondaryApiUrl
+        .replace(/\/+$/, '')
+        .replace(/\/chat\/completions\/?$/, '');
+
+    const messages = [];
+    if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
+    }
+    messages.push({ role: 'user', content: userPrompt });
+
+    log('Calling secondary API via server proxy:', baseUrl, 'model:', s.secondaryApiModel);
+
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            chat_completion_source: 'openai',
+            reverse_proxy: baseUrl,
+            proxy_password: s.secondaryApiKey,
+            model: s.secondaryApiModel || undefined,
+            messages: messages,
+            temperature: s.secondaryApiTemperature ?? 0.3,
+            max_tokens: (maxTokens && maxTokens > 0) ? maxTokens : undefined,
+            stream: false,
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`Secondary API error ${response.status}: ${errText.substring(0, 200)}`);
+    }
+
+    const responseText = await response.text();
+    let data;
     try {
-      log(`[创建] "${comment}" → "${bookName}"`);
-      const uidStr = await ST.execSlash(`/createentry file="${bookName}" ${content}`);
-      const uid = uidStr?.trim();
-      if (!uid || uid === '' || isNaN(uid)) { error(`创建失败: "${comment}"`); return null; }
-      await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=comment ${comment}`);
-      if (entryConfig.type === 'constant') await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=constant true`);
-      await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=position ${posNum}`);
-      if (entryConfig.order !== undefined) await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=order ${entryConfig.order}`);
-      if (posNum >= 4 && entryConfig.depth) await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=depth ${entryConfig.depth}`);
-      log(`[创建] "${comment}" UID=${uid} ✓`);
-      return parseInt(uid);
-    } catch (e) { error(`创建 "${comment}" 异常`, e); return null; }
-  }
-
-  async _updateContent(bookName, uid, content) {
-    try { await ST.execSlash(`/setentryfield file="${bookName}" uid=${uid} field=content ${content}`); return true; }
-    catch (e) { error(`更新 UID=${uid} 失败`, e); return false; }
-  }
-
-  async _upsertEntry(comment, content, config = {}) {
-    if (!this.lorebookName) return;
-    let uid = this.entryUids[comment];
-    if (uid === undefined || uid === null) {
-      uid = await this._findUid(this.lorebookName, comment);
-      if (uid !== null) this.entryUids[comment] = uid;
+        data = JSON.parse(responseText);
+    } catch (e) {
+        warn('Failed to parse server response as JSON:', e.message, 'raw:', responseText.substring(0, 300));
+        throw new Error(`Server response is not valid JSON: ${e.message}`);
     }
-    if (uid !== null && uid !== undefined) { await this._updateContent(this.lorebookName, uid, content); }
-    else {
-      const newUid = await this._createEntry(this.lorebookName, comment, content, config);
-      if (newUid !== null) this.entryUids[comment] = newUid;
+
+    let content = data.choices?.[0]?.message?.content;
+    if (!content && typeof data === 'string') content = data;
+
+    if (!content) {
+        warn('Secondary API response structure:', JSON.stringify(data).substring(0, 500));
+        throw new Error('Secondary API returned empty response');
     }
-  }
 
-  async _loadEntryMap() {
-    this.entryUids = {};
-    if (!this.lorebookName) return;
-    log(`加载条目: "${this.lorebookName}"`);
-    for (const name of Object.keys(CONFIG.ENTRIES)) {
-      const uid = await this._findUid(this.lorebookName, name);
-      if (uid !== null) this.entryUids[name] = uid;
-      await wait(50);
+    log('Secondary API response length:', content.length);
+    return content;
+}
+
+/**
+ * Call secondary API with tool calling support.
+ * Returns { content, toolCalls } where toolCalls is an array of parsed tool calls.
+ */
+async function callSecondaryApiWithTools(systemPrompt, userPrompt, tools, maxTokens) {
+    const s = getSettings();
+    const baseUrl = s.secondaryApiUrl
+        .replace(/\/+$/, '')
+        .replace(/\/chat\/completions\/?$/, '');
+
+    const messages = [];
+    if (systemPrompt) {
+        messages.push({ role: 'system', content: systemPrompt });
     }
-    const missing = Object.keys(CONFIG.ENTRIES).filter(n => this.entryUids[n] === undefined);
-    if (missing.length > 0) {
-      log(`补建 ${missing.length} 个: ${missing.join(', ')}`);
-      for (const name of missing) {
-        const cfg = CONFIG.ENTRIES[name];
-        const uid = await this._createEntry(this.lorebookName, name, cfg.content, cfg);
-        if (uid !== null) this.entryUids[name] = uid;
-        await wait(150);
-      }
-    }
-  }
+    messages.push({ role: 'user', content: userPrompt });
 
-  async init(force = false) {
-    return opQueue.enqueue('初始化', async () => {
-      if (!force && this.initialized) return;
-      this.charName = ST.getCharName();
-      if (!this.charName || this.charName === '未知角色' || this.charName === 'undefined') {
-        this.lorebookName = null; this.entryUids = {}; this.initialized = false;
-        updateSettingsStatus('⚠️ 请先选择角色'); return;
-      }
-      const books = await this.getCharMemoryBooks();
-      const baseName = `${this.charName}${CONFIG.LOREBOOK_SUFFIX}`;
-      const savedBook = getSettings().lastUsedBooks?.[this.charName];
-      const activeWorlds = await ST.getActiveWorldBooks();
-      const activeMemBook = books.find(b => activeWorlds.includes(b));
+    log('Calling secondary API with tools:', tools.map(t => t.function.name));
 
-      if (activeMemBook) { this.lorebookName = activeMemBook; log(`✓ 已激活: ${activeMemBook}`); }
-      else if (savedBook && books.includes(savedBook)) { this.lorebookName = savedBook; }
-      else if (books.includes(baseName)) { this.lorebookName = baseName; }
-      else if (books.length > 0) { this.lorebookName = books[0]; }
-      else { this.lorebookName = null; }
+    const body = {
+        chat_completion_source: 'openai',
+        reverse_proxy: baseUrl,
+        proxy_password: s.secondaryApiKey,
+        model: s.secondaryApiModel || undefined,
+        messages: messages,
+        temperature: s.secondaryApiTemperature ?? 0.3,
+        max_tokens: (maxTokens && maxTokens > 0) ? maxTokens : undefined,
+        stream: false,
+        tools: tools,
+        tool_choice: 'auto',
+    };
 
-      if (this.lorebookName) { await this._loadEntryMap(); saveLastUsedBook(this.charName, this.lorebookName); }
-      else { this.entryUids = {}; }
-
-      this.initialized = true;
-      updateSettingsStatus(this.lorebookName ? '✅ 运行中' : '⏳ 未绑定');
-      updateSettingsBook(this.lorebookName || '无');
-      updateSettingsChar(this.charName);
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(body),
     });
-  }
 
-  async getCharMemoryBooks() {
+    if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`Secondary API (tools) error ${response.status}: ${errText.substring(0, 200)}`);
+    }
+
+    const responseText = await response.text();
+    let data;
     try {
-      const allBooks = await ST.getAllWorldNames();
-      let cn = this.charName || ST.getCharName();
-      if (!cn || cn === '未知角色') return [];
-      this.charName = cn;
-      const pattern = `${cn}${CONFIG.LOREBOOK_SUFFIX}`;
-      const result = allBooks.filter(b => b.startsWith(pattern));
-      result.sort((a, b) => a === pattern ? -1 : b === pattern ? 1 : a.localeCompare(b));
-      return result;
-    } catch (e) { error('获取列表失败', e); return []; }
-  }
+        data = JSON.parse(responseText);
+    } catch (e) {
+        throw new Error(`Server response is not valid JSON: ${e.message}`);
+    }
 
-  async deactivateOthers(except = null) {
-    try {
-      const books = await this.getCharMemoryBooks();
-      for (const b of books) { if (b !== except) { await ST.setWorldActive(b, false); await wait(100); } }
-    } catch (e) { log('取消激活失败', e); }
-  }
+    const message = data.choices?.[0]?.message;
+    const content = message?.content || '';
+    const rawToolCalls = message?.tool_calls || [];
 
-  async createMain() {
-    return opQueue.enqueue('创建主线', async () => {
-      const cn = ST.getCharName();
-      if (!cn || cn === '未知角色') { await ST.toast('⚠️ 请先选择角色'); return null; }
-      const name = `${cn}${CONFIG.LOREBOOK_SUFFIX}`;
-      const all = await ST.getAllWorldNames();
-      if (all.includes(name)) {
-        await this.deactivateOthers(name); await ST.setWorldActive(name, true);
-        this.lorebookName = name; this.charName = cn; await this._loadEntryMap();
-        saveLastUsedBook(cn, name); await ST.toast(`✅ "${name}" 已激活`);
-        updateSettingsBook(name); return name;
-      }
-      const ok = await ST.createWorld(name);
-      if (!ok) { await ST.toast('❌ 创建失败'); return null; }
-      this.lorebookName = name; this.charName = cn; this.entryUids = {};
-      await wait(800); await this.deactivateOthers(name); await ST.setWorldActive(name, true); await wait(500);
-      for (const [n, cfg] of Object.entries(CONFIG.ENTRIES)) {
-        const uid = await this._createEntry(name, n, cfg.content, cfg);
-        if (uid !== null) this.entryUids[n] = uid; await wait(200);
-      }
-      saveLastUsedBook(cn, name); await ST.toast(`✅ "${name}" 创建成功`);
-      updateSettingsBook(name); return name;
-    });
-  }
-
-  async createCustom(suffix) {
-    return opQueue.enqueue(`创建: ${suffix}`, async () => {
-      const cn = ST.getCharName();
-      if (!cn || cn === '未知角色') { await ST.toast('⚠️ 请先选择角色'); return null; }
-      const newName = `${cn}${CONFIG.LOREBOOK_SUFFIX}${CONFIG.LOREBOOK_BRANCH_SEPARATOR}${suffix}`;
-      const all = await ST.getAllWorldNames();
-      if (all.includes(newName)) { await ST.toast(`⚠️ "${newName}" 已存在`); return null; }
-      const ok = await ST.createWorld(newName);
-      if (!ok) { await ST.toast('❌ 创建失败'); return null; }
-      this.lorebookName = newName; this.charName = cn; this.entryUids = {};
-      await wait(800); await this.deactivateOthers(newName); await ST.setWorldActive(newName, true); await wait(500);
-      for (const [n, cfg] of Object.entries(CONFIG.ENTRIES)) {
-        const uid = await this._createEntry(newName, n, cfg.content, cfg);
-        if (uid !== null) this.entryUids[n] = uid; await wait(200);
-      }
-      saveLastUsedBook(cn, newName); await ST.toast(`✅ "${newName}" 创建成功`);
-      updateSettingsBook(newName); return newName;
-    });
-  }
-
-  async switchTo(bookName) {
-    return opQueue.enqueue(`切换: ${bookName}`, async () => {
-      await this.deactivateOthers(bookName); await wait(200);
-      await ST.setWorldActive(bookName, true);
-      this.lorebookName = bookName; this.entryUids = {};
-      await wait(300); await this._loadEntryMap();
-      saveLastUsedBook(this.charName, bookName);
-      await ST.toast(`✅ 已切换: ${bookName}`);
-      updateSettingsBook(bookName); return true;
-    });
-  }
-
-  async copyTo(newSuffix) {
-    return opQueue.enqueue(`复制: ${newSuffix}`, async () => {
-      if (!this.lorebookName) { await ST.toast('⚠️ 没有可复制的'); return false; }
-      const cn = ST.getCharName();
-      const newName = `${cn}${CONFIG.LOREBOOK_SUFFIX}${CONFIG.LOREBOOK_BRANCH_SEPARATOR}${newSuffix}`;
-      const all = await ST.getAllWorldNames();
-      if (all.includes(newName)) { await ST.toast(`⚠️ "${newName}" 已存在`); return false; }
-      const ok = await ST.createWorld(newName);
-      if (!ok) { await ST.toast('❌ 创建失败'); return false; }
-      await wait(800); await this.deactivateOthers(newName); await ST.setWorldActive(newName, true); await wait(500);
-      const oldBook = this.lorebookName;
-      const oldUids = { ...this.entryUids };
-      this.entryUids = {};
-      for (const [comment, uid] of Object.entries(oldUids)) {
+    // Parse tool call arguments
+    const toolCalls = rawToolCalls.map(tc => {
+        let args = {};
         try {
-          const content = await ST.execSlash(`/getentryfield file="${oldBook}" field=content ${uid}`);
-          const cfg = CONFIG.ENTRIES[comment] || {};
-          const newUid = await this._createEntry(newName, comment, content || cfg.content || '', cfg);
-          if (newUid !== null) this.entryUids[comment] = newUid; await wait(150);
-        } catch (e) { error(`复制 "${comment}" 失败`, e); }
-      }
-      this.lorebookName = newName; saveLastUsedBook(cn, newName);
-      await ST.toast(`✅ 已复制到 "${newName}"`);
-      updateSettingsBook(newName); return true;
+            args = typeof tc.function?.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : tc.function?.arguments || {};
+        } catch (e) {
+            warn('Failed to parse tool call arguments:', tc.function?.arguments);
+        }
+        return {
+            name: tc.function?.name || '',
+            arguments: args,
+        };
     });
-  }
 
-  getDisplayName() {
-    if (!this.lorebookName) return '未绑定';
-    const base = `${this.charName}${CONFIG.LOREBOOK_SUFFIX}`;
-    if (this.lorebookName === base) return `${this.lorebookName} (主线)`;
-    if (this.lorebookName.startsWith(base + CONFIG.LOREBOOK_BRANCH_SEPARATOR)) {
-      const branch = this.lorebookName.substring(base.length + CONFIG.LOREBOOK_BRANCH_SEPARATOR.length);
-      return `${this.lorebookName} (分支: ${branch})`;
-    }
-    return this.lorebookName;
-  }
-
-  _extractBetween(text, startTitles, endTitles) {
-    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const sp = startTitles.map(t => `#{1,6}\\s*${esc(t)}`).join('|');
-    const ep = endTitles.length > 0 ? endTitles.map(t => `#{1,6}\\s*${esc(t)}`).join('|') : null;
-    const re = ep ? new RegExp(`((?:${sp})[\\s\\S]*?)(?=(?:${ep})|$)`, 'i') : new RegExp(`((?:${sp})[\\s\\S]*)$`, 'i');
-    return text.match(re)?.[1]?.trim() || null;
-  }
-
-  extractSections(text) {
-    const s = {};
-    s.newCharacters = this._extractBetween(text, ['新增角色信息', '新增角色'], ['角色变化总结', '角色变化', '回忆', '重要物品记录', '重要物品', '主要角色关键事件记录', '关键事件记录', '当前剧情提示']);
-    s.characterChanges = this._extractBetween(text, ['角色变化总结', '角色变化'], ['回忆', '重要物品记录', '重要物品', '主要角色关键事件记录', '关键事件记录', '当前剧情提示']);
-    s.memory = this._extractBetween(text, ['回忆'], ['重要物品记录', '重要物品', '主要角色关键事件记录', '关键事件记录', '当前剧情提示']);
-    s.items = this._extractBetween(text, ['重要物品记录', '重要物品'], ['主要角色关键事件记录', '关键事件记录', '当前剧情提示']);
-    s.keyEvents = this._extractBetween(text, ['主要角色关键事件记录', '关键事件记录', '关键事件'], ['当前剧情提示']);
-    log('提取:', Object.fromEntries(Object.entries(s).map(([k, v]) => [k, v ? `✓(${v.length})` : '✗'])));
-    return s;
-  }
-
-  async updateFromSummary(summaryText) {
-    if (!this.lorebookName) { await ST.toast('⚠️ 请先创建或选择世界书'); return; }
-    return opQueue.enqueue('写入总结', async () => {
-      const sec = this.extractSections(summaryText);
-      const map = { newCharacters: '新增角色', characterChanges: '角色变化', memory: '回忆', items: '物品记录', keyEvents: 'keyevents' };
-      let count = 0;
-      for (const [key, name] of Object.entries(map)) {
-        if (sec[key]) { await this._upsertEntry(name, sec[key]); await wait(200); count++; }
-      }
-      await ST.toast(count ? `✅ ${count}部分 → ${this.lorebookName}` : '⚠️ 未提取到内容');
-    });
-  }
-
-  async updateSingle(sectionName, content) {
-    if (!this.lorebookName) { await ST.toast('⚠️ 请先创建世界书'); return; }
-    const map = { new_characters: '新增角色', character_changes: '角色变化', memory: '回忆', items: '物品记录', key_events: 'keyevents' };
-    const entryName = map[sectionName] || sectionName;
-    return opQueue.enqueue(`更新: ${entryName}`, async () => {
-      await this._upsertEntry(entryName, content);
-      await ST.toast(`✅ ${entryName} → ${this.lorebookName}`);
-    });
-  }
+    log('Tool calls received:', toolCalls.length, toolCalls.map(tc => `${tc.name}(${JSON.stringify(tc.arguments)})`));
+    return { content, toolCalls };
 }
 
-// ==================== FloorManager ====================
-class FloorManager {
-  async trimAndSendPlot(msgIndex, options = {}) {
-    const { saveToVar = true, sendAsMessage = true, messageMode = 'sys', hideOriginal = false } = options;
-    return opQueue.enqueue('裁剪发送', async () => {
-      const idx = msgIndex ?? ST.getLastMessageId();
-      const msg = ST.getMessage(idx);
-      if (!msg) { await ST.toast('❌ 未找到消息'); return false; }
-      const content = msg.mes || msg.message || '';
-      const match = content.match(/(#{1,6}\s*当前剧情提示[\s\S]*)/i);
-      if (!match) { await ST.toast('❌ 未找到"当前剧情提示"'); return false; }
-      const plot = match[1].trim();
-      if (saveToVar) {
-        try { const esc = plot.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r'); if (esc.length < 5000) await ST.execSlash(`/setvar key=current_plot_prompt "${esc}"`); } catch { }
-      }
-      if (sendAsMessage) {
-        try { const cmds = { sys: `/sys ${plot}`, narrator: `/sendas name=📜剧情提示 ${plot}`, user: `/send ${plot}` }; await ST.execSlash(cmds[messageMode] || cmds.sys); } catch (e) { error('发送失败', e); }
-      }
-      if (hideOriginal) { try { await ST.execSlash(`/hide ${idx}`); } catch { } }
-      await ST.toast('✅ 完成'); return true;
-    });
-  }
-
-  async hideMessages(mode) {
-    return opQueue.enqueue(`隐藏: ${mode}`, async () => {
-      const lastId = ST.getLastMessageId();
-      if (lastId < 2) { await ST.toast('⚠️ 消息不足'); return false; }
-      const modes = {
-        keep_last_ai_and_prompt: { cmd: `/hide 0-${lastId - 3}`, desc: '保留最近AI+剧情提示' },
-        keep_greeting_last_ai_and_prompt: { cmd: `/hide 1-${lastId - 3}`, desc: '保留开场白+最近AI+剧情提示', min: 3 },
-        keep_prompt_only: { cmd: `/hide 0-${lastId - 1}`, desc: '仅保留剧情提示' },
-        keep_greeting_and_prompt: { cmd: `/hide 1-${lastId - 1}`, desc: '保留开场白+剧情提示' },
-      };
-      const m = modes[mode];
-      if (!m) { await ST.toast('❌ 未知模式'); return false; }
-      if (m.min && lastId < m.min) { await ST.toast('⚠️ 消息不足'); return false; }
-      await ST.execSlash(m.cmd);
-      await ST.toast(`✅ ${m.desc}`); return true;
-    });
-  }
-}
-
-// ==================== 实例 ====================
-const manager = new LorebookManager();
-const floorMgr = new FloorManager();
-let uiState = { menuOpen: false, processing: false, bookList: [] };
-
-// ==================== Settings 显示 ====================
-function updateSettingsStatus(t) { const e = document.getElementById('mem_mgr_status_text'); if (e) e.textContent = t; }
-function updateSettingsBook(t) { const e = document.getElementById('mem_mgr_current_book'); if (e) e.textContent = t; }
-function updateSettingsChar(t) { const e = document.getElementById('mem_mgr_current_char'); if (e) e.textContent = t; }
-
-// ==================== 解析 ====================
-async function ensureBound() {
-  if (!manager.lorebookName) {
-    await manager.init(true);
-    if (!manager.lorebookName) { await ST.toast('⚠️ 请先创建或选择世界书'); return false; }
-  }
-  return true;
-}
-
-async function parseFull() {
-  if (!await ensureBound()) return;
-  const lastMsg = ST.getLastMessage();
-  if (!lastMsg) { await ST.toast('❌ 没有消息'); return; }
-  const content = lastMsg.mes || lastMsg.message || '';
-  const tag = CONFIG.SUMMARY_TAG;
-  if (content.includes(`<${tag}>`) && content.includes(`</${tag}>`)) {
-    const m = content.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'i'));
-    if (m) { await ST.toast(`📝 写入: ${manager.lorebookName}`); await manager.updateFromSummary(m[1]); }
-  } else {
-    await ST.toast(`⚠️ 最后消息不含 <${tag}>`);
-  }
-}
-
-// ★★★ 新增：发送总结指令 ★★★
-async function sendSummaryCommand(type) {
-  const prompt = CONFIG.SUMMARY_PROMPTS[type];
-  if (!prompt) {
-    await ST.toast('❌ 未知的总结类型');
-    return;
-  }
-
-  try {
-    log(`发送总结指令: ${type}`);
-    await ST.execSlash(`/send ${prompt}`);
-
-    const typeNames = { full: '📋 大总结', compress: '🗜️ 二次总结' };
-    await ST.toast(`✅ ${typeNames[type] || type} 指令已发送！请等待AI回复后点击🔄解析写入`);
-  } catch (e) {
-    error('发送总结指令失败', e);
-    await ST.toast('❌ 发送失败，请查看控制台');
-  }
-}
-
-// ==================== UI ====================
-function buildFabHTML() {
-  return `
-<div id="mem-fab-root">
-  <div class="mem-dock-handle" id="memDockHandle"></div>
-  <div class="mem-fab-main" id="memFabMain"><div class="mem-fab-icon"></div></div>
-  <div class="mem-fab-menu">
-    <div class="mem-fab-menu-item" data-action="open_settings"><span>⚙️</span><div class="mem-fab-tooltip">存档设置</div></div>
-    <div class="mem-fab-menu-item" data-action="open_summary"><span>📝</span><div class="mem-fab-tooltip">总结指令</div></div>
-    <div class="mem-fab-menu-item" data-action="open_floor"><span>📋</span><div class="mem-fab-tooltip">楼层管理</div></div>
-    <div class="mem-fab-menu-item" data-action="open_help"><span>📖</span><div class="mem-fab-tooltip">使用说明</div></div>
-    <div class="mem-fab-menu-item" data-action="parse_all"><span>🔄</span><div class="mem-fab-tooltip">解析写入</div></div>
-    <div class="mem-fab-menu-item" data-action="create_book"><span>📚</span><div class="mem-fab-tooltip">创建世界书</div></div>
-  </div>
-</div>
-<div class="mem-fab-overlay" id="memFabOverlay"></div>
-<div id="mem-toast-fallback" style="display:none;position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:rgba(30,30,40,.92);color:#fff;padding:12px 24px;border-radius:12px;font-size:13px;z-index:999999;pointer-events:none;backdrop-filter:blur(8px);box-shadow:0 4px 20px rgba(0,0,0,.3);max-width:80vw;text-align:center"></div>`;
-}
-
-function buildPanelsHTML() {
-  return `
-<div class="mem-panel-overlay" id="memSettingsPanel">
-  <div class="mem-panel">
-    <div class="mem-panel-header"><div class="mem-panel-title">⚙️ 存档管理</div><button class="mem-panel-close" id="memCloseSettings">×</button></div>
-    <div class="mem-info-card"><div class="mem-info-label">当前绑定</div><div class="mem-info-value" id="memPanelBookName">点击刷新</div></div>
-    <div class="mem-btn-grid" style="margin-bottom:20px"><button class="mem-btn mem-btn-primary mem-btn-full" id="memRefreshBooks">🔍 刷新（自动检测已激活的世界书）</button></div>
-    <div class="mem-group"><div class="mem-list-title">📖 回忆存档</div><div id="memBookList"><div class="mem-book-item" style="color:#888">点击刷新</div></div></div>
-    <div class="mem-divider"></div>
-    <div class="mem-group"><div class="mem-group-title">🆕 创建</div><label class="mem-input-label">存档后缀</label><input type="text" class="mem-input" id="memNewSuffix" placeholder="例如：第二章、HE路线"><div class="mem-btn-grid" style="margin-top:10px"><button class="mem-btn mem-btn-primary mem-btn-full" id="memCreateBook">➕ 创建</button></div></div>
-    <div class="mem-divider"></div>
-    <div class="mem-group"><div class="mem-group-title">📋 复制当前</div><label class="mem-input-label">新后缀</label><input type="text" class="mem-input" id="memCopySuffix" placeholder="例如：备份"><div class="mem-btn-grid" style="margin-top:10px"><button class="mem-btn mem-btn-secondary mem-btn-full" id="memCopyBook">📋 复制</button></div></div>
-  </div>
-</div>
-
-<!-- ★★★ 新增：总结指令面板（替代原写入面板）★★★ -->
-<div class="mem-panel-overlay" id="memSummaryPanel">
-  <div class="mem-panel">
-    <div class="mem-panel-header">
-      <div class="mem-panel-title">📝 总结指令</div>
-      <button class="mem-panel-close" id="memCloseSummary">×</button>
-    </div>
-
-    <p style="font-size:13px;color:#666;margin:0 0 20px 0;line-height:1.6;">
-      选择总结类型，指令将以用户消息发送。<br>AI回复后点击 <b>🔄解析写入</b> 写入世界书。
-    </p>
-
-    <!-- 大总结卡片 -->
-    <div class="mem-summary-card" id="memSummaryFull">
-      <div class="mem-summary-card-icon">📋</div>
-      <div class="mem-summary-card-body">
-        <div class="mem-summary-card-title">大总结</div>
-        <div class="mem-summary-card-desc">
-          停止角色扮演，从第一天开始<br>对所有剧情进行完整总结
-        </div>
-      </div>
-      <div class="mem-summary-card-arrow">→</div>
-    </div>
-
-    <!-- 二次总结卡片 -->
-    <div class="mem-summary-card mem-summary-card-compress" id="memSummaryCompress">
-      <div class="mem-summary-card-icon">🗜️</div>
-      <div class="mem-summary-card-body">
-        <div class="mem-summary-card-title">二次总结（压缩）</div>
-        <div class="mem-summary-card-desc">
-          停止角色扮演，对已有内容深度压缩
-        </div>
-        <div class="mem-summary-card-rules">
-          <span>📌 回忆去主观感受，保因果链</span>
-          <span>📌 不可压缩 → 英文/文言文</span>
-        </div>
-      </div>
-      <div class="mem-summary-card-arrow">→</div>
-    </div>
-
-    <div class="mem-divider"></div>
-
-    <!-- 当前绑定的世界书 -->
-    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:rgba(0,0,0,0.02);border-radius:12px;">
-      <span style="font-size:12px;color:#888;">写入目标：</span>
-      <span style="font-size:13px;font-weight:600;color:#667eea;" id="memSummaryTarget">点击🔄刷新</span>
-    </div>
-  </div>
-</div>
-
-<div class="mem-panel-overlay" id="memFloorPanel">
-  <div class="mem-panel">
-    <div class="mem-panel-header"><div class="mem-panel-title">📋 楼层管理</div><button class="mem-panel-close" id="memCloseFloor">×</button></div>
-    <div class="mem-group"><div class="mem-group-title">👁️ 隐藏历史</div>
-      <div class="mem-hide-option" data-hide="keep_last_ai_and_prompt"><div class="mem-hide-option-title">🔹 保留最近AI+剧情提示</div><div class="mem-hide-option-desc">隐藏0→当前-3</div></div>
-      <div class="mem-hide-option" data-hide="keep_greeting_last_ai_and_prompt"><div class="mem-hide-option-title">🔹 保留开场白+最近AI+剧情提示</div><div class="mem-hide-option-desc">隐藏1→当前-3</div></div>
-      <div class="mem-hide-option" data-hide="keep_prompt_only"><div class="mem-hide-option-title">🔹 仅保留剧情提示</div><div class="mem-hide-option-desc">隐藏0→当前-1</div></div>
-      <div class="mem-hide-option" data-hide="keep_greeting_and_prompt"><div class="mem-hide-option-title">🔹 保留开场白+剧情提示</div><div class="mem-hide-option-desc">隐藏1→当前-1</div></div>
-    </div>
-    <div class="mem-divider"></div>
-    <div class="mem-group"><div class="mem-group-title">✂️ 提取当前剧情提示</div>
-      <div class="mem-option-card"><label><input type="checkbox" id="memTrimSaveVar" checked><span>💾 保存到变量</span></label></div>
-      <div class="mem-option-card"><label><input type="checkbox" id="memTrimSendMsg" checked><span>📤 发送为新楼层</span></label></div>
-      <div class="mem-option-card"><label><input type="checkbox" id="memTrimHideOrig"><span>👁️ 隐藏原消息</span></label></div>
-      <div class="mem-send-mode-group" id="memSendModeGroup"><div class="mem-send-mode-title">发送模式：</div><div class="mem-send-mode-options"><label><input type="radio" name="memSendMode" value="sys" checked><span>📜 系统旁白</span></label><label><input type="radio" name="memSendMode" value="narrator"><span>🎭 叙述者</span></label><label><input type="radio" name="memSendMode" value="user"><span>👤 用户</span></label></div></div>
-      <div class="mem-btn-grid"><button class="mem-btn mem-btn-warning mem-btn-full" id="memTrimSend">✂️ 提取并发送</button></div>
-    </div>
-  </div>
-</div>
-<div class="mem-panel-overlay" id="memHelpPanel">
-  <div class="mem-panel">
-    <div class="mem-panel-header"><div class="mem-panel-title">📖 使用说明</div><button class="mem-panel-close" id="memCloseHelp">×</button></div>
-    <div class="mem-help-content">
-      <div class="mem-help-section"><div class="mem-help-section-title">🎯 功能</div><div class="mem-help-section-content"><ul>
-        <li><b>存档管理</b>：创建、切换、复制回忆世界书</li>
-        <li><b>📝 总结指令</b>：一键发送大总结/二次压缩指令</li>
-        <li><b>🔄 解析写入</b>：AI回复后解析总结并写入世界书</li>
-        <li><b>楼层管理</b>：提取剧情提示、隐藏历史消息</li>
-      </ul></div></div>
-      <div class="mem-help-section"><div class="mem-help-section-title">📝 使用流程</div><div class="mem-help-section-content"><ol>
-        <li>📚 创建世界书</li>
-        <li>📝 发送总结指令（大总结或二次总结）</li>
-        <li>等待AI回复完成</li>
-        <li>🔄 点击解析写入，自动写入世界书</li>
-        <li>📋 楼层管理 → 隐藏历史 + 提取剧情提示</li>
-        <li>继续角色扮演！</li>
-      </ol>
-      <p>💡 悬浮球可<b>拖拽</b>，拖到边缘自动收起</p>
-      <p>🔍 刷新会自动检测你在酒馆全局世界书面板里激活的世界书</p>
-      </div></div>
-      <div class="mem-help-section"><div class="mem-help-section-title">🗜️ 二次总结说明</div><div class="mem-help-section-content">
-        <p>当总结内容过长消耗太多token时，使用二次总结进行深度压缩：</p>
-        <ul>
-          <li>回忆部分去除主观感受，只保留事件因果链</li>
-          <li>无法压缩的内容改写为英文或文言文节约token</li>
-          <li>合并同类事件，删除冗余描述</li>
-        </ul>
-      </div></div>
-      <div class="mem-warning-box"><div class="mem-warning-box-title">🚨 警告</div><div class="mem-warning-box-content">此为福利群特供，请勿二传二改！</div></div>
-      <div class="mem-author-box"><div class="mem-author-name">👤 金瓜瓜</div><div class="mem-author-contact">📧 gua.guagua.uk 💬 QQ: 787849315</div><div class="mem-author-warning">🎁 举报二传可获至少10元API额度！</div></div>
-    </div>
-  </div>
-</div>`;
-}
-
-// ==================== 拖拽 ====================
-class DragDock {
-  constructor(fabRoot, onTapCallback) {
-    this.el = fabRoot; this.dragging = false; this.hasMoved = false;
-    this.moveThreshold = 6; this.startCX = 0; this.startCY = 0;
-    this.offsetX = 0; this.offsetY = 0; this.posX = 0; this.posY = 0;
-    this.onTap = onTapCallback; this.ballSize = 80;
-    this._onDown = this._onDown.bind(this);
-    this._onMove = this._onMove.bind(this);
-    this._onUp = this._onUp.bind(this);
-    this.el.querySelector('.mem-fab-main').addEventListener('pointerdown', this._onDown);
-    document.addEventListener('pointermove', this._onMove);
-    document.addEventListener('pointerup', this._onUp);
-  }
-  setPosition(x, y) { this.posX = x; this.posY = y; this.el.style.left = `${x}px`; this.el.style.top = `${y}px`; }
-  _onDown(e) {
-    if (uiState.menuOpen) return;
-    this.dragging = true; this.hasMoved = false;
-    this.startCX = e.clientX; this.startCY = e.clientY;
-    this.offsetX = e.clientX - this.posX; this.offsetY = e.clientY - this.posY;
-    this.el.classList.add('mem-dragging');
-    this.el.classList.remove('mem-docked-left', 'mem-docked-right');
-  }
-  _onMove(e) {
-    if (!this.dragging) return;
-    if (!this.hasMoved && (Math.abs(e.clientX - this.startCX) > this.moveThreshold || Math.abs(e.clientY - this.startCY) > this.moveThreshold)) this.hasMoved = true;
-    if (this.hasMoved) {
-      const x = Math.max(-this.ballSize * 0.4, Math.min(window.innerWidth - this.ballSize * 0.6, e.clientX - this.offsetX));
-      const y = Math.max(0, Math.min(window.innerHeight - this.ballSize, e.clientY - this.offsetY));
-      this.setPosition(x, y);
-    }
-  }
-  _onUp() {
-    if (!this.dragging) return;
-    this.dragging = false; this.el.classList.remove('mem-dragging');
-    if (!this.hasMoved) { if (this.onTap) this.onTap(); return; }
-    const cx = this.posX + this.ballSize / 2;
+/**
+ * Call secondary API with arbitrary messages array (for multi-round tool calling).
+ * Returns { content, toolCalls, rawMessage, rawToolCalls }
+ */
+async function callSecondaryApiChat(messages, tools, maxTokens) {
     const s = getSettings();
-    if (cx < CONFIG.DOCK_THRESHOLD) {
-      this.setPosition(0, this.posY); this.el.classList.add('mem-docked-left');
-      s.isDocked = true; s.dockedSide = 'left';
-    } else if (cx > window.innerWidth - CONFIG.DOCK_THRESHOLD) {
-      this.setPosition(window.innerWidth - this.ballSize, this.posY);
-      this.el.classList.add('mem-docked-right'); s.isDocked = true; s.dockedSide = 'right';
-    } else { s.isDocked = false; s.dockedSide = null; }
-    s.fabPosX = this.posX; s.fabPosY = this.posY; saveSettingsDebounced();
-  }
-  undock() {
-    const s = getSettings();
-    this.el.classList.remove('mem-docked-left', 'mem-docked-right');
-    const nx = Math.min(window.innerWidth - this.ballSize - 20, Math.max(20, window.innerWidth / 2 - this.ballSize / 2));
-    this.setPosition(nx, this.posY);
-    s.isDocked = false; s.dockedSide = null; s.fabPosX = nx; s.fabPosY = this.posY; saveSettingsDebounced();
-  }
-  restorePosition() {
-    const s = getSettings();
-    let x = s.fabPosX, y = s.fabPosY;
-    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) { x = window.innerWidth - 120; y = window.innerHeight / 2 - 40; }
-    this.setPosition(x, y);
-    if (s.isDocked && s.dockedSide) this.el.classList.add(`mem-docked-${s.dockedSide}`);
-  }
-}
-
-// ==================== 面板刷新 ====================
-async function refreshPanelData() {
-  const bookName = manager.lorebookName;
-  const display = manager.getDisplayName();
-  const el1 = document.getElementById('memPanelBookName');
-  const el2 = document.getElementById('memSummaryTarget'); // ★ 改为总结面板的目标显示
-  if (el1) el1.textContent = bookName ? display : '⚠️ 未绑定';
-  if (el2) el2.textContent = bookName ? display : '⚠️ 请先创建世界书';
-  updateSettingsBook(bookName || '无');
-  updateSettingsChar(manager.charName || '无');
-
-  const books = await manager.getCharMemoryBooks();
-  uiState.bookList = books;
-  const container = document.getElementById('memBookList');
-  if (!container) return;
-  if (!books.length) { container.innerHTML = '<div class="mem-book-item" style="color:#888">暂无</div>'; return; }
-
-  const activeWorlds = await ST.getActiveWorldBooks();
-  const baseName = manager.charName ? `${manager.charName}${CONFIG.LOREBOOK_SUFFIX}` : null;
-
-  container.innerHTML = books.map((b, i) => {
-    const cur = b === manager.lorebookName;
-    const main = baseName && b === baseName;
-    const active = activeWorlds.includes(b);
-    let badge = '';
-    if (cur && main) badge = '<span class="mem-book-badge">当前·主线</span>';
-    else if (cur) badge = '<span class="mem-book-badge">当前</span>';
-    else if (main) badge = '<span class="mem-book-badge" style="background:#27ae60">主线</span>';
-    if (active && !cur) badge += '<span class="mem-book-badge" style="background:#e67e22;margin-left:4px">已激活</span>';
-    return `<div class="mem-book-item ${cur ? 'mem-current' : ''}" data-bi="${i}"><span>${escHTML(b)}</span><div>${badge}</div></div>`;
-  }).join('');
-
-  container.querySelectorAll('.mem-book-item[data-bi]').forEach(item => {
-    item.addEventListener('click', async () => {
-      const idx = parseInt(item.dataset.bi);
-      if (isNaN(idx) || !uiState.bookList[idx]) return;
-      setProcessing(true);
-      try { await manager.switchTo(uiState.bookList[idx]); await refreshPanelData(); }
-      finally { setProcessing(false); }
-    });
-  });
-}
-
-function escHTML(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function setProcessing(v) {
-  uiState.processing = v;
-  const m = document.querySelector('.mem-fab-main');
-  if (m) m.classList.toggle('mem-processing', v);
-}
-
-// ==================== 事件绑定 ====================
-// ==================== 事件绑定 ====================
-function bindEvents(fabRoot, dragDock) {
-  const $ = s => document.querySelector(s);
-  const $$ = s => document.querySelectorAll(s);
-
-  // ★ 修复2：面板刚打开的防抖标记
-  let panelJustOpened = false;
-
-  fabRoot.querySelector('.mem-dock-handle').addEventListener('click', e => { e.stopPropagation(); dragDock.undock(); });
-  fabRoot.querySelector('.mem-dock-handle').addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation(); dragDock.undock(); });
-  $('#memFabOverlay').addEventListener('click', () => { uiState.menuOpen = false; fabRoot.classList.remove('mem-active'); $('#memFabOverlay').classList.remove('mem-visible'); });
-
-  const closePanel = id => $(`#${id}`)?.classList.remove('mem-active');
-  const openPanel = id => {
-    uiState.menuOpen = false; fabRoot.classList.remove('mem-active');
-    $('#memFabOverlay').classList.remove('mem-visible');
-
-    // ★ 修复2：设置防抖，阻止 pointerup → click 穿透
-    panelJustOpened = true;
-    setTimeout(() => { panelJustOpened = false; }, 400);
-
-    $(`#${id}`)?.classList.add('mem-active');
-    if (id === 'memSettingsPanel' || id === 'memSummaryPanel') refreshPanelData();
-  };
-
-  $('#memCloseSettings')?.addEventListener('click', () => closePanel('memSettingsPanel'));
-  $('#memCloseSummary')?.addEventListener('click', () => closePanel('memSummaryPanel'));
-  $('#memCloseFloor')?.addEventListener('click', () => closePanel('memFloorPanel'));
-  $('#memCloseHelp')?.addEventListener('click', () => closePanel('memHelpPanel'));
-  $$('.mem-panel-overlay').forEach(ov => { ov.addEventListener('click', e => { if (e.target === ov) ov.classList.remove('mem-active'); }); });
-
-  // ★★★ 修复2：总结指令按钮加防抖检查 ★★★
-  $('#memSummaryFull')?.addEventListener('click', async (e) => {
-    // ★ 面板刚打开时忽略这次点击（是穿透过来的）
-    if (uiState.processing || panelJustOpened) {
-      e.preventDefault();
-      e.stopPropagation();
-      return;
+    const baseUrl = s.secondaryApiUrl
+        .replace(/\/+$/, '')
+        .replace(/\/chat\/completions\/?$/, '');
+    const body = {
+        chat_completion_source: 'openai',
+        reverse_proxy: baseUrl,
+        proxy_password: s.secondaryApiKey,
+        model: s.secondaryApiModel || undefined,
+        messages: messages,
+        temperature: s.secondaryApiTemperature ?? 0.3,
+        max_tokens: (maxTokens && maxTokens > 0) ? maxTokens : undefined,
+        stream: false,
+    };
+    if (tools && tools.length > 0) {
+        body.tools = tools;
+        body.tool_choice = 'auto';
     }
-    setProcessing(true);
+    const response = await fetch('/api/backends/chat-completions/generate', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`Secondary API error ${response.status}: ${errText.substring(0, 200)}`);
+    }
+    const responseText = await response.text();
+    let respData;
     try {
-      await sendSummaryCommand('full');
-      closePanel('memSummaryPanel');
-    } finally { setProcessing(false); }
-  });
-
-  $('#memSummaryCompress')?.addEventListener('click', async (e) => {
-    // ★ 面板刚打开时忽略这次点击
-    if (uiState.processing || panelJustOpened) {
-      e.preventDefault();
-      e.stopPropagation();
-      return;
+        respData = JSON.parse(responseText);
+    } catch (e) {
+        throw new Error(`Response not valid JSON: ${e.message}`);
     }
-    setProcessing(true);
-    try {
-      await sendSummaryCommand('compress');
-      closePanel('memSummaryPanel');
-    } finally { setProcessing(false); }
-  });
-
-  $$('.mem-fab-menu-item').forEach(item => {
-    item.addEventListener('pointerup', async e => {
-      e.stopPropagation();
-      // ★ 修复2：阻止后续 click 事件冒泡穿透
-      e.preventDefault();
-      if (uiState.processing) return;
-      const action = item.dataset.action;
-      switch (action) {
-        case 'open_settings': openPanel('memSettingsPanel'); break;
-        case 'open_summary': openPanel('memSummaryPanel'); break;
-        case 'open_floor': openPanel('memFloorPanel'); break;
-        case 'open_help': openPanel('memHelpPanel'); break;
-        case 'parse_all':
-          uiState.menuOpen = false; fabRoot.classList.remove('mem-active');
-          $('#memFabOverlay').classList.remove('mem-visible');
-          setProcessing(true);
-          try { await parseFull(); } finally { setProcessing(false); }
-          break;
-        case 'create_book':
-          uiState.menuOpen = false; fabRoot.classList.remove('mem-active');
-          $('#memFabOverlay').classList.remove('mem-visible');
-          const suf = prompt('输入后缀（留空=主线）');
-          if (suf === null) break;
-          setProcessing(true);
-          try {
-            if (suf.trim()) await manager.createCustom(suf.trim());
-            else await manager.createMain();
-            await refreshPanelData();
-          } finally { setProcessing(false); }
-          break;
-      }
+    const rawMessage = respData.choices?.[0]?.message || {};
+    const content = rawMessage.content || '';
+    const rawToolCalls = rawMessage.tool_calls || [];
+    const toolCalls = rawToolCalls.map(tc => {
+        let args = {};
+        try {
+            args = typeof tc.function?.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : tc.function?.arguments || {};
+        } catch (e) {
+            warn('Failed to parse tool call arguments:', tc.function?.arguments);
+        }
+        return { name: tc.function?.name || '', arguments: args };
     });
-  });
-
-  // 设置面板按钮
-  $('#memRefreshBooks')?.addEventListener('click', async () => {
-    setProcessing(true);
-    try { await manager.init(true); await refreshPanelData(); }
-    finally { setProcessing(false); }
-  });
-  $('#memCreateBook')?.addEventListener('click', async () => {
-    const v = $('#memNewSuffix')?.value?.trim();
-    if (!v) { await ST.toast('请输入后缀'); return; }
-    setProcessing(true);
-    try { await manager.createCustom(v); $('#memNewSuffix').value = ''; await refreshPanelData(); }
-    finally { setProcessing(false); }
-  });
-  $('#memCopyBook')?.addEventListener('click', async () => {
-    const v = $('#memCopySuffix')?.value?.trim();
-    if (!v) { await ST.toast('请输入后缀'); return; }
-    setProcessing(true);
-    try { await manager.copyTo(v); $('#memCopySuffix').value = ''; await refreshPanelData(); }
-    finally { setProcessing(false); }
-  });
-
-  // 楼层管理
-  $$('.mem-hide-option').forEach(opt => {
-    opt.addEventListener('click', async () => {
-      if (uiState.processing) return;
-      setProcessing(true);
-      try { await floorMgr.hideMessages(opt.dataset.hide); closePanel('memFloorPanel'); }
-      finally { setProcessing(false); }
-    });
-  });
-  $('#memTrimSendMsg')?.addEventListener('change', function () {
-    const g = $('#memSendModeGroup'); if (g) g.style.display = this.checked ? 'block' : 'none';
-  });
-  $('#memTrimSend')?.addEventListener('click', async () => {
-    if (uiState.processing) return;
-    const sv = $('#memTrimSaveVar')?.checked ?? true;
-    const sm = $('#memTrimSendMsg')?.checked ?? true;
-    const ho = $('#memTrimHideOrig')?.checked ?? false;
-    let mode = 'sys';
-    document.querySelectorAll('input[name="memSendMode"]').forEach(r => { if (r.checked) mode = r.value; });
-    if (!sv && !sm) { await ST.toast('请至少选一个'); return; }
-    setProcessing(true);
-    try { await floorMgr.trimAndSendPlot(null, { saveToVar: sv, sendAsMessage: sm, messageMode: mode, hideOriginal: ho }); closePanel('memFloorPanel'); }
-    finally { setProcessing(false); }
-  });
+    log('API chat response:', toolCalls.length, 'tool calls');
+    return { content, toolCalls, rawMessage, rawToolCalls };
 }
 
+async function testSecondaryApi() {
+    const s = getSettings();
+    if (!s.secondaryApiUrl || !s.secondaryApiKey) {
+        toastr?.warning?.('请先填写副API地址和密钥', 'Memory Manager');
+        return;
+    }
 
-// ==================== Settings 面板 ====================
+    try {
+        toastr?.info?.('正在测试副API连接...', 'Memory Manager');
+        const result = await callSecondaryApi(
+            '你是一个测试助手。',
+            '请回复"连接成功"四个字。',
+            50,
+        );
+        toastr?.success?.(`副API连接成功！回复: ${result.substring(0, 100)}`, 'Memory Manager');
+    } catch (err) {
+        toastr?.error?.(`副API连接失败: ${err.message}`, 'Memory Manager');
+    }
+}
+
+// ============================================================
+//  Settings
+// ============================================================
+
+function getSettings() {
+    if (!extension_settings[MODULE_NAME]) {
+        extension_settings[MODULE_NAME] = { ...DEFAULT_SETTINGS };
+    }
+    return extension_settings[MODULE_NAME];
+}
+
+function loadSettings() {
+    const s = getSettings();
+    for (const [key, val] of Object.entries(DEFAULT_SETTINGS)) {
+        if (s[key] === undefined) s[key] = val;
+    }
+
+    // Migrate old autoCompress → new toggles
+    if (s.autoCompress !== undefined) {
+        if (s.compressTimeline === undefined) s.compressTimeline = s.autoCompress;
+        if (s.compressPages === undefined) s.compressPages = s.autoCompress;
+        if (s.archiveDaily === undefined) s.archiveDaily = false;
+        delete s.autoCompress;
+        // Migrate old archiveAfterPages → archiveThreshold
+        if (s.archiveAfterPages !== undefined) {
+            delete s.archiveAfterPages;
+        }
+        saveSettingsDebounced();
+    }
+
+    $('#mm_enabled').prop('checked', s.enabled);
+    $('#mm_debug').prop('checked', s.debug);
+    $('#mm_extraction_interval').val(s.extractionInterval);
+    $('#mm_extraction_interval_value').text(s.extractionInterval);
+    $('#mm_extraction_max_tokens').val(s.extractionMaxTokens);
+    $('#mm_index_depth').val(s.indexDepth);
+    $('#mm_recall_depth').val(s.recallDepth);
+    $('#mm_max_pages').val(s.maxPages);
+    $('#mm_max_pages_value').text(s.maxPages);
+    $('#mm_show_recall_badges').prop('checked', s.showRecallBadges);
+
+    // Compression
+    $('#mm_compress_timeline').prop('checked', s.compressTimeline);
+    $('#mm_compress_pages').prop('checked', s.compressPages);
+    $('#mm_archive_daily').prop('checked', s.archiveDaily);
+
+    // Auto-hide
+    $('#mm_auto_hide').prop('checked', s.autoHide);
+    $('#mm_keep_recent_messages').val(s.keepRecentMessages);
+    toggleAutoHideFields(s.autoHide);
+
+    // Secondary API
+    $('#mm_use_secondary_api').prop('checked', s.useSecondaryApi);
+    $('#mm_secondary_api_url').val(s.secondaryApiUrl);
+    $('#mm_secondary_api_key').val(s.secondaryApiKey);
+    $('#mm_secondary_api_model').val(s.secondaryApiModel);
+    $('#mm_secondary_api_temperature').val(s.secondaryApiTemperature);
+    toggleSecondaryApiFields(s.useSecondaryApi);
+
+    // Known characters
+    $('#mm_known_characters').val(s.knownCharacters);
+
+    // Save management
+    $('#mm_auto_save_slot').prop('checked', s.autoSaveSlot);
+
+    // Embedding
+    $('#mm_use_embedding').prop('checked', s.useEmbedding);
+    $('#mm_embedding_model').val(s.embeddingModel);
+    $('#mm_embedding_dimensions').val(s.embeddingDimensions);
+    $('#mm_embedding_dimensions_value').text(s.embeddingDimensions);
+    $('#mm_embedding_top_k').val(s.embeddingTopK);
+    $('#mm_embedding_top_k_value').text(s.embeddingTopK);
+    $('#mm_embedding_api_url').val(s.embeddingApiUrl);
+    $('#mm_embedding_api_key').val(s.embeddingApiKey);
+    toggleEmbeddingFields(s.useEmbedding);
+
+    // Update slot display
+    refreshSlotListUI();
+}
+
+function saveSetting(key, value) {
+    getSettings()[key] = value;
+    saveSettingsDebounced();
+}
+
+/**
+ * Get the set of known character names (from settings + {{char}}).
+ * These characters only get attitude tracking, not full dossiers.
+ */
+function getKnownCharacterNames() {
+    const s = getSettings();
+    const ctx = getContext();
+    const charName = (ctx.name2 || '').trim(); // {{char}} = name2
+    const fromSetting = (s.knownCharacters || '')
+        .split(/[,，]/)
+        .map(n => n.trim())
+        .filter(Boolean);
+    const result = new Set(fromSetting);
+    if (charName) result.add(charName);
+    return result;
+}
+
 function bindSettingsPanel() {
-  const settings = getSettings();
-  const cb1 = document.getElementById('mem_mgr_enabled');
-  const cb2 = document.getElementById('mem_mgr_debug');
-  const btn = document.getElementById('mem_mgr_reset_pos');
-  if (cb1) {
-    cb1.checked = settings.enabled;
-    cb1.addEventListener('change', () => {
-      settings.enabled = cb1.checked; saveSettingsDebounced();
-      const r = document.getElementById('mem-fab-root');
-      if (r) r.classList.toggle('mem-hidden', !settings.enabled);
-      updateSettingsStatus(settings.enabled ? '✅ 运行中' : '⏸ 已禁用');
+    $('#mm_enabled').on('change', function () { saveSetting('enabled', this.checked); });
+    $('#mm_debug').on('change', function () { saveSetting('debug', this.checked); });
+    $('#mm_extraction_interval').on('input', function () {
+        const v = Number(this.value);
+        $('#mm_extraction_interval_value').text(v);
+        saveSetting('extractionInterval', v);
     });
-  }
-  if (cb2) { cb2.checked = settings.debug; cb2.addEventListener('change', () => { settings.debug = cb2.checked; saveSettingsDebounced(); }); }
-  if (btn) {
-    btn.addEventListener('click', () => {
-      settings.fabPosX = window.innerWidth - 120; settings.fabPosY = window.innerHeight / 2 - 40;
-      settings.isDocked = false; settings.dockedSide = null; saveSettingsDebounced();
-      const r = document.getElementById('mem-fab-root');
-      if (r) { r.classList.remove('mem-docked-left', 'mem-docked-right'); r.style.left = `${settings.fabPosX}px`; r.style.top = `${settings.fabPosY}px`; }
-      ST.toast('✅ 已重置');
+    $('#mm_extraction_max_tokens').on('change', function () { saveSetting('extractionMaxTokens', Number(this.value)); });
+    $('#mm_index_depth').on('change', function () { saveSetting('indexDepth', Number(this.value)); });
+    $('#mm_recall_depth').on('change', function () { saveSetting('recallDepth', Number(this.value)); });
+    $('#mm_max_pages').on('input', function () {
+        const v = Number(this.value);
+        $('#mm_max_pages_value').text(v);
+        saveSetting('maxPages', v);
     });
-  }
+    $('#mm_show_recall_badges').on('change', function () { saveSetting('showRecallBadges', this.checked); });
+    $('#mm_compress_timeline').on('change', function () { saveSetting('compressTimeline', this.checked); });
+    $('#mm_compress_pages').on('change', function () { saveSetting('compressPages', this.checked); });
+    $('#mm_archive_daily').on('change', function () { saveSetting('archiveDaily', this.checked); });
+    $('#mm_known_characters').on('change', function () { saveSetting('knownCharacters', this.value.trim()); });
+
+    // Auto-hide bindings
+    $('#mm_auto_hide').on('change', function () {
+        saveSetting('autoHide', this.checked);
+        toggleAutoHideFields(this.checked);
+        if (this.checked) hideProcessedMessages();
+    });
+    $('#mm_keep_recent_messages').on('change', function () {
+        saveSetting('keepRecentMessages', Number(this.value));
+        hideProcessedMessages();
+    });
+
+    // Secondary API bindings
+    $('#mm_use_secondary_api').on('change', function () {
+        saveSetting('useSecondaryApi', this.checked);
+        toggleSecondaryApiFields(this.checked);
+    });
+    $('#mm_secondary_api_url').on('change', function () { saveSetting('secondaryApiUrl', this.value.trim()); });
+    $('#mm_secondary_api_key').on('change', function () { saveSetting('secondaryApiKey', this.value.trim()); });
+    $('#mm_secondary_api_model').on('change', function () { saveSetting('secondaryApiModel', this.value.trim()); });
+    $('#mm_secondary_api_temperature').on('change', function () { saveSetting('secondaryApiTemperature', Number(this.value)); });
+    $('#mm_test_secondary_api').on('click', testSecondaryApi);
+
+    // Save management bindings
+    $('#mm_auto_save_slot').on('change', function () { saveSetting('autoSaveSlot', this.checked); });
+    $('#mm_save_now').on('click', async () => {
+        const charName = getCurrentCharName();
+        if (!charName) { toastr.warning('请先选择角色'); return; }
+        const idx = getSaveIndex();
+        const active = idx[charName]?.activeSlot || '主线';
+        await saveToSlot(charName, active);
+        toastr.success(`已保存到存档「${active}」`);
+        refreshSlotListUI();
+    });
+    $('#mm_new_slot').on('click', async () => {
+        const charName = getCurrentCharName();
+        if (!charName) { toastr.warning('请先选择角色'); return; }
+        const name = prompt('新存档名称:', `IF线${Date.now() % 1000}`);
+        if (!name) return;
+        await saveToSlot(charName, name.trim());
+        toastr.success(`已创建存档「${name.trim()}」`);
+        refreshSlotListUI();
+    });
+
+    // Embedding bindings
+    $('#mm_use_embedding').on('change', function () {
+        saveSetting('useEmbedding', this.checked);
+        toggleEmbeddingFields(this.checked);
+    });
+    $('#mm_embedding_model').on('change', function () { saveSetting('embeddingModel', this.value.trim()); });
+    $('#mm_embedding_dimensions').on('input', function () {
+        const v = Number(this.value);
+        $('#mm_embedding_dimensions_value').text(v);
+        saveSetting('embeddingDimensions', v);
+    });
+    $('#mm_embedding_top_k').on('input', function () {
+        const v = Number(this.value);
+        $('#mm_embedding_top_k_value').text(v);
+        saveSetting('embeddingTopK', v);
+    });
+    $('#mm_embedding_api_url').on('change', function () { saveSetting('embeddingApiUrl', this.value.trim()); });
+    $('#mm_embedding_api_key').on('change', function () { saveSetting('embeddingApiKey', this.value.trim()); });
+    $('#mm_test_embedding').on('click', async () => {
+        try {
+            const result = await testEmbeddingApi();
+            $('#mm_embedding_status').text(`连接成功！向量维度: ${result}`);
+            toastr.success('Embedding API 连接成功');
+        } catch (err) {
+            $('#mm_embedding_status').text(`连接失败: ${err.message}`);
+            toastr.error('Embedding API 连接失败: ' + err.message);
+        }
+    });
+    $('#mm_rebuild_vectors').on('click', async () => {
+        if (!confirm('重建向量库将为所有页面重新生成向量，确认？')) return;
+        try {
+            $('#mm_embedding_status').text('正在重建向量库...');
+            await rebuildAllVectors();
+            const data = getMemoryData();
+            const count = Object.keys(data.embeddings).length;
+            $('#mm_embedding_status').text(`重建完成！已索引 ${count} 个页面`);
+            toastr.success(`向量库重建完成，${count} 个页面已索引`);
+        } catch (err) {
+            $('#mm_embedding_status').text(`重建失败: ${err.message}`);
+            toastr.error('向量库重建失败: ' + err.message);
+        }
+    });
+
+    $('#mm_rebuild_categories').on('click', async () => {
+        if (!confirm('将使用副API为所有未分类页面自动分配语义标签，确认？')) return;
+        try {
+            $('#mm_embedding_status').text('正在分配分类标签...');
+            await rebuildCategories();
+            $('#mm_embedding_status').text('分类标签分配完成');
+        } catch (err) {
+            $('#mm_embedding_status').text(`分类分配失败: ${err.message}`);
+            toastr.error('分类标签分配失败: ' + err.message);
+        }
+    });
+
+    // Action buttons
+    $('#mm_force_extract').on('click', () => safeExtract(true));
+    $('#mm_force_compress').on('click', () => safeCompress(true));
+    $('#mm_initialize').on('click', performBatchInitialization);
+    $('#mm_reset').on('click', onResetClick);
+    $('#mm_export').on('click', onExportClick);
+    $('#mm_import').on('click', onImportClick);
+    $('#mm_edit_timeline').on('click', onEditTimelineClick);
+    $('#mm_add_known_char').on('click', onAddKnownChar);
+    $('#mm_add_npc_char').on('click', onAddNpcChar);
+    $('#mm_add_item').on('click', onAddItem);
 }
 
-// ==================== 主初始化 ====================
-jQuery(async () => {
-  console.log('[回忆管理器] v2.9.0 初始化...');
-  if (!extension_settings[MODULE_NAME]) extension_settings[MODULE_NAME] = {};
-  const settings = extension_settings[MODULE_NAME];
-  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) { if (settings[k] === undefined) settings[k] = v; }
+// ============================================================
+//  Data Layer
+// ============================================================
 
-  try {
-    const html = await $.get(`${EXTENSION_PATH}/settings.html`);
-    $('#extensions_settings2').append(html);
+function createDefaultData() {
+    return {
+        version: DATA_VERSION,
+
+        // Timeline text (maintained by LLM, periodically compressed)
+        timeline: '',
+
+        // Known character attitudes (from char card / settings, attitude only)
+        knownCharacterAttitudes: [],
+
+        // NPC character dossiers (full detail, for new/random NPCs)
+        characters: [],
+
+        // Item list
+        items: [],
+
+        // Story pages (detailed event descriptions, progressively compressed)
+        // Each page now includes: categories: string[] (semantic tags)
+        pages: [],
+
+        // Embedding vector cache: { [pageId]: number[] }
+        embeddings: {},
+
+        // Processing state
+        processing: {
+            lastExtractedMessageId: -1,
+            extractionInProgress: false,
+        },
+
+        // Per-message recall records (for UI display)
+        messageRecalls: {},
+    };
+}
+
+/**
+ * Migrate v1 data (old storyBible structure) to v2 (PageIndex structure).
+ */
+function migrateV1toV2(oldData) {
+    log('Migrating data from v1 to v2...');
+    const newData = createDefaultData();
+
+    // Migrate timeline
+    if (oldData.storyBible?.timeline) {
+        newData.timeline = oldData.storyBible.timeline;
+    }
+
+    // Migrate characters
+    if (Array.isArray(oldData.storyBible?.characters)) {
+        newData.characters = oldData.storyBible.characters.map(c => ({
+            name: c.name || '',
+            appearance: c.appearance || '',
+            personality: c.personality || '',
+            attitude: c.relationship || c.attitude || '',
+        }));
+    }
+
+    // Migrate items
+    if (Array.isArray(oldData.storyBible?.items)) {
+        newData.items = oldData.storyBible.items.map(item => ({
+            name: item.name || '',
+            status: item.status || '',
+            significance: item.significance || '',
+        }));
+    }
+
+    // Migrate memories → pages
+    if (Array.isArray(oldData.memories)) {
+        newData.pages = oldData.memories
+            .filter(m => m.status === 'active')
+            .map(m => ({
+                id: m.id || generateId(),
+                day: m.day || '',
+                title: m.title || '',
+                content: m.content || '',
+                keywords: m.tags || [],
+                characters: [],
+                significance: m.significance || 'medium',
+                compressionLevel: COMPRESS_FRESH,
+                sourceMessages: m.sourceMessages || [],
+                createdAt: m.createdAt || Date.now(),
+                compressedAt: null,
+            }));
+    }
+
+    // Migrate processing state
+    if (oldData.processing) {
+        newData.processing = { ...newData.processing, ...oldData.processing };
+    }
+
+    // Migrate messageRecalls
+    if (oldData.messageRecalls) {
+        newData.messageRecalls = oldData.messageRecalls;
+    }
+
+    log('Migration complete. Pages:', newData.pages.length, 'Characters:', newData.characters.length);
+    return newData;
+}
+
+/**
+ * Migrate v2 data to v3: split characters into knownCharacterAttitudes + NPC characters.
+ */
+function migrateV2toV3(oldData) {
+    log('Migrating data from v2 to v3...');
+    const newData = createDefaultData();
+
+    newData.timeline = oldData.timeline || '';
+    newData.items = oldData.items || [];
+    newData.pages = oldData.pages || [];
+    newData.processing = { ...newData.processing, ...(oldData.processing || {}) };
+    newData.messageRecalls = oldData.messageRecalls || {};
+
+    // Split characters into known vs new NPC
+    const knownNames = getKnownCharacterNames();
+    if (Array.isArray(oldData.characters)) {
+        for (const c of oldData.characters) {
+            if (!c.name) continue;
+            const attitude = c.attitude || c.relationship || '';
+            if (knownNames.has(c.name)) {
+                newData.knownCharacterAttitudes.push({
+                    name: c.name,
+                    attitude: attitude,
+                });
+            } else {
+                newData.characters.push({
+                    name: c.name,
+                    appearance: c.appearance || '',
+                    personality: c.personality || '',
+                    attitude: attitude,
+                });
+            }
+        }
+    }
+
+    log('Migration v2->v3 complete. Known:', newData.knownCharacterAttitudes.length,
+        'NPC:', newData.characters.length);
+    return newData;
+}
+
+/**
+ * Migrate v3 data to v4: add categories to pages + embeddings cache.
+ */
+function migrateV3toV4(oldData) {
+    log('Migrating data from v3 to v4...');
+    const newData = createDefaultData();
+
+    newData.timeline = oldData.timeline || '';
+    newData.knownCharacterAttitudes = oldData.knownCharacterAttitudes || [];
+    newData.characters = oldData.characters || [];
+    newData.items = oldData.items || [];
+    newData.processing = { ...newData.processing, ...(oldData.processing || {}) };
+    newData.messageRecalls = oldData.messageRecalls || {};
+
+    // Migrate pages: add categories field to each page
+    newData.pages = (oldData.pages || []).map(p => ({
+        ...p,
+        categories: Array.isArray(p.categories) ? p.categories : [],
+    }));
+
+    // Embeddings start empty (user can rebuild via "重建向量库" button)
+    newData.embeddings = {};
+
+    log('Migration v3->v4 complete. Pages:', newData.pages.length);
+    return newData;
+}
+
+function getMemoryData() {
+    const ctx = getContext();
+    if (!ctx.chatMetadata) return createDefaultData();
+    if (!ctx.chatMetadata.memoryManager) {
+        ctx.chatMetadata.memoryManager = createDefaultData();
+    }
+    let d = ctx.chatMetadata.memoryManager;
+
+    // Handle migration chain
+    if (d.version !== DATA_VERSION) {
+        if (d.version === 1 || d.storyBible) {
+            d = migrateV1toV2(d);
+        }
+        if (d.version === 2) {
+            d = migrateV2toV3(d);
+        }
+        if (d.version === 3) {
+            d = migrateV3toV4(d);
+        }
+        if (d.version !== DATA_VERSION) {
+            d.version = DATA_VERSION;
+        }
+        ctx.chatMetadata.memoryManager = d;
+        saveMemoryData();
+        log('Data migrated and saved');
+    }
+
+    // Ensure knownCharacterAttitudes exists for older v3 data
+    if (!Array.isArray(d.knownCharacterAttitudes)) {
+        d.knownCharacterAttitudes = [];
+    }
+
+    // Ensure embeddings object exists
+    if (!d.embeddings || typeof d.embeddings !== 'object') {
+        d.embeddings = {};
+    }
+
+    return d;
+}
+
+function saveMemoryData() {
+    saveMetadataDebounced();
+}
+
+// ============================================================
+//  Independent Save System (存档系统)
+// ============================================================
+
+function getSaveIndex() {
+    const s = getSettings();
+    if (!s.saveIndex) s.saveIndex = {};
+    return s.saveIndex;
+}
+
+function updateSaveIndex(charName, slotData) {
+    const idx = getSaveIndex();
+    idx[charName] = slotData;
+    saveSettingsDebounced();
+}
+
+function listSlots(charName) {
+    const idx = getSaveIndex();
+    return idx[charName]?.slots || [];
+}
+
+function getActiveSlotName(charName) {
+    const idx = getSaveIndex();
+    return idx[charName]?.activeSlot || null;
+}
+
+async function saveToSlot(charName, slotName) {
+    if (!charName) return;
+    const data = getMemoryData();
+
+    // Serialize memory data
+    const saveData = { ...data };
+    const json = JSON.stringify(saveData);
+    const bytes = new TextEncoder().encode(json);
+    let binary = '';
+    for (const b of bytes) binary += String.fromCharCode(b);
+    const base64 = btoa(binary);
+
+    // Sanitize filename: ST only allows [a-zA-Z0-9_-], no Chinese chars
+    const safeChar = charName.replace(/[^a-zA-Z0-9_-]/g, '') || 'char';
+    const safeSlot = slotName.replace(/[^a-zA-Z0-9_-]/g, '') || 'slot';
+    const fileName = `mm-save-${safeChar}-${safeSlot}-${Date.now()}.json`;
+
+    try {
+        const response = await fetch('/api/files/upload', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                name: fileName,
+                data: base64,
+            }),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Upload failed: ${response.status}`);
+        }
+
+        const result = await response.json();
+        const filePath = result.path;
+
+        // Update save index
+        const idx = getSaveIndex();
+        if (!idx[charName]) {
+            idx[charName] = { activeSlot: slotName, slots: [] };
+        }
+
+        // Find existing slot or create new
+        const existingSlot = idx[charName].slots.find(s => s.name === slotName);
+        if (existingSlot) {
+            // Delete old file
+            try {
+                await fetch('/api/files/delete', {
+                    method: 'POST',
+                    headers: getRequestHeaders(),
+                    body: JSON.stringify({ path: existingSlot.path }),
+                });
+            } catch (e) {
+                warn('Failed to delete old save file:', e);
+            }
+            existingSlot.path = filePath;
+            existingSlot.updatedAt = Date.now();
+            existingSlot.pageCount = data.pages.length;
+        } else {
+            idx[charName].slots.push({
+                name: slotName,
+                path: filePath,
+                updatedAt: Date.now(),
+                pageCount: data.pages.length,
+            });
+        }
+
+        idx[charName].activeSlot = slotName;
+        updateSaveIndex(charName, idx[charName]);
+
+        log('Saved to slot:', charName, slotName, filePath);
+        return true;
+    } catch (err) {
+        warn('Save to slot failed:', err);
+        toastr?.error?.(`存档保存失败: ${err.message}`, 'Memory Manager');
+        return false;
+    }
+}
+
+async function loadFromSlot(charName, slotName) {
+    const idx = getSaveIndex();
+    const slot = idx[charName]?.slots?.find(s => s.name === slotName);
+    if (!slot) {
+        toastr?.warning?.('找不到存档', 'Memory Manager');
+        return false;
+    }
+
+    try {
+        const response = await fetch(slot.path);
+        if (!response.ok) {
+            throw new Error(`Fetch failed: ${response.status}`);
+        }
+
+        let imported = await response.json();
+
+        // Run migration chain if needed
+        if (imported.storyBible || imported.version === 1) {
+            imported = migrateV1toV2(imported);
+        }
+        if (imported.version === 2) {
+            imported = migrateV2toV3(imported);
+        }
+        if (imported.version === 3) {
+            imported = migrateV3toV4(imported);
+        }
+        imported.version = DATA_VERSION;
+
+        const ctx = getContext();
+        ctx.chatMetadata.memoryManager = imported;
+        saveMemoryData();
+
+        // Update active slot
+        idx[charName].activeSlot = slotName;
+        updateSaveIndex(charName, idx[charName]);
+
+        updateBrowserUI();
+        log('Loaded from slot:', charName, slotName);
+        toastr?.success?.(`已加载存档「${slotName}」`, 'Memory Manager');
+        return true;
+    } catch (err) {
+        warn('Load from slot failed:', err);
+        toastr?.error?.(`存档加载失败: ${err.message}`, 'Memory Manager');
+        return false;
+    }
+}
+
+async function deleteSlot(charName, slotName) {
+    const idx = getSaveIndex();
+    const charIdx = idx[charName];
+    if (!charIdx) return;
+
+    const slotIdx = charIdx.slots.findIndex(s => s.name === slotName);
+    if (slotIdx === -1) return;
+
+    const slot = charIdx.slots[slotIdx];
+
+    // Delete file
+    try {
+        await fetch('/api/files/delete', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ path: slot.path }),
+        });
+    } catch (e) {
+        warn('Failed to delete save file:', e);
+    }
+
+    // Remove from index
+    charIdx.slots.splice(slotIdx, 1);
+    if (charIdx.activeSlot === slotName) {
+        charIdx.activeSlot = charIdx.slots.length > 0 ? charIdx.slots[0].name : null;
+    }
+
+    updateSaveIndex(charName, charIdx);
+    log('Deleted slot:', charName, slotName);
+}
+
+function getCurrentCharName() {
+    const ctx = getContext();
+    return (ctx.name2 || '').trim();
+}
+
+async function autoSaveIfEnabled() {
+    const s = getSettings();
+    if (!s.autoSaveSlot) return;
+
+    const charName = getCurrentCharName();
+    if (!charName) return;
+
+    const activeSlot = getActiveSlotName(charName);
+    if (activeSlot) {
+        await saveToSlot(charName, activeSlot);
+    }
+}
+
+// ============================================================
+//  Embedding Vector Retrieval (直接调用中转站 /v1/embeddings)
+// ============================================================
+
+function cosineSimilarity(a, b) {
+    let dot = 0, normA = 0, normB = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        normA += a[i] * a[i];
+        normB += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+function getEmbeddingBaseUrl() {
+    const s = getSettings();
+    const url = (s.embeddingApiUrl || s.secondaryApiUrl || '').trim();
+    return url
+        .replace(/\/+$/, '')
+        .replace(/\/chat\/completions\/?$/, '');
+}
+
+function getEmbeddingApiKey() {
+    const s = getSettings();
+    return (s.embeddingApiKey || s.secondaryApiKey || '').trim();
+}
+
+function isEmbeddingConfigured() {
+    const s = getSettings();
+    return s.useEmbedding && getEmbeddingBaseUrl() && getEmbeddingApiKey();
+}
+
+async function callEmbeddingsApi(texts) {
+    const s = getSettings();
+    const baseUrl = getEmbeddingBaseUrl();
+    const apiKey = getEmbeddingApiKey();
+
+    if (!baseUrl || !apiKey) {
+        throw new Error('Embedding API not configured');
+    }
+
+    log('Calling embedding API:', baseUrl, 'model:', s.embeddingModel, 'texts:', texts.length);
+
+    const response = await fetch(`${baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+            model: s.embeddingModel || 'text-embedding-3-large',
+            input: texts,
+            dimensions: s.embeddingDimensions || 256,
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`Embedding API error ${response.status}: ${errText.substring(0, 200)}`);
+    }
+
+    const result = await response.json();
+    return result.data.map(d => d.embedding);
+}
+
+async function embedPage(page) {
+    if (!isEmbeddingConfigured()) return;
+    const data = getMemoryData();
+    try {
+        const text = `${page.title}: ${page.content}`;
+        const [vector] = await callEmbeddingsApi([text]);
+        data.embeddings[page.id] = vector;
+        saveMemoryData();
+        log('Embedded page:', page.id, page.title);
+    } catch (err) {
+        warn('Failed to embed page:', page.id, err);
+    }
+}
+
+async function embedCharacter(char) {
+    if (!isEmbeddingConfigured()) return;
+    const data = getMemoryData();
+    try {
+        const text = `角色 ${char.name}: 外貌: ${char.appearance || ''} 性格: ${char.personality || ''} 关系: ${char.relationship || ''} 态度: ${char.attitude || ''} 状态: ${char.currentState || ''}`;
+        const [vector] = await callEmbeddingsApi([text]);
+        data.embeddings[`char_${char.name}`] = vector;
+        saveMemoryData();
+        log('Embedded character:', char.name);
+    } catch (err) {
+        warn('Failed to embed character:', char.name, err);
+    }
+}
+
+async function embedAllPages(pages) {
+    if (!isEmbeddingConfigured()) return;
+    const data = getMemoryData();
+    const batchSize = 20;
+
+    for (let i = 0; i < pages.length; i += batchSize) {
+        const batch = pages.slice(i, i + batchSize);
+        const texts = batch.map(p => `${p.title}: ${p.content}`);
+
+        try {
+            const vectors = await callEmbeddingsApi(texts);
+            for (let j = 0; j < batch.length; j++) {
+                data.embeddings[batch[j].id] = vectors[j];
+            }
+        } catch (err) {
+            warn('Failed to embed batch starting at', i, err);
+        }
+    }
+
+    saveMemoryData();
+    log('Embedded all pages:', pages.length);
+}
+
+async function embeddingPreFilter(data, recentText, topK) {
+    try {
+        const [queryVec] = await callEmbeddingsApi([recentText]);
+
+        // Score pages
+        const scoredPages = [];
+        for (const page of data.pages) {
+            if (page.compressionLevel > COMPRESS_SUMMARY) continue;
+            const pageVec = data.embeddings[page.id];
+            if (!pageVec) continue;
+            const score = cosineSimilarity(queryVec, pageVec);
+            scoredPages.push({ page, score });
+        }
+        scoredPages.sort((a, b) => b.score - a.score);
+
+        // Score characters
+        const scoredChars = [];
+        for (const char of data.characters) {
+            const charVec = data.embeddings[`char_${char.name}`];
+            if (!charVec) continue;
+            const score = cosineSimilarity(queryVec, charVec);
+            scoredChars.push({ char, score });
+        }
+        scoredChars.sort((a, b) => b.score - a.score);
+
+        const pageResults = scoredPages.slice(0, topK);
+        const charResults = scoredChars.filter(r => r.score >= 0.45).slice(0, 2);
+
+        log('Embedding pre-filter results:', pageResults.map(r => `${r.page.title}(${r.score.toFixed(3)})`));
+        if (charResults.length > 0) {
+            log('Embedding character matches:', charResults.map(r => `${r.char.name}(${r.score.toFixed(3)})`));
+        }
+        return {
+            pages: pageResults.map(r => r.page),
+            characters: charResults.map(r => r.char),
+        };
+    } catch (err) {
+        warn('Embedding pre-filter failed:', err);
+        return null;
+    }
+}
+
+async function testEmbeddingApi() {
+    try {
+        toastr?.info?.('正在测试Embedding API连接...', 'Memory Manager');
+        const vectors = await callEmbeddingsApi(['测试文本']);
+        if (vectors && vectors[0] && vectors[0].length > 0) {
+            toastr?.success?.(`Embedding连接成功！返回${vectors[0].length}维向量`, 'Memory Manager');
+        } else {
+            toastr?.error?.('Embedding API返回了空结果', 'Memory Manager');
+        }
+    } catch (err) {
+        toastr?.error?.(`Embedding连接失败: ${err.message}`, 'Memory Manager');
+    }
+}
+
+async function rebuildAllVectors() {
+    const data = getMemoryData();
+    const pages = data.pages.filter(p => p.compressionLevel <= COMPRESS_SUMMARY);
+    const chars = data.characters || [];
+    if (pages.length === 0 && chars.length === 0) {
+        toastr?.warning?.('没有可索引的内容', 'Memory Manager');
+        return;
+    }
+
+    toastr?.info?.(`正在为${pages.length}个页面和${chars.length}个角色生成向量...`, 'Memory Manager');
+    data.embeddings = {};
+    await embedAllPages(pages);
+    for (const char of chars) {
+        await embedCharacter(char);
+    }
+
+    const indexed = Object.keys(data.embeddings).length;
+    toastr?.success?.(`向量库重建完成: ${indexed} 条已索引（${pages.length}页 + ${chars.length}角色）`, 'Memory Manager');
+    updateBrowserUI();
+}
+
+/**
+ * Retroactively assign semantic categories to pages that have none.
+ * Uses LLM to analyze each page's content and assign 1-3 categories.
+ */
+async function rebuildCategories() {
+    const s = getSettings();
+    const data = getMemoryData();
+    const pagesNeedingCats = data.pages.filter(p =>
+        p.compressionLevel <= COMPRESS_SUMMARY && (!p.categories || p.categories.length === 0),
+    );
+
+    if (pagesNeedingCats.length === 0) {
+        toastr?.info?.('所有页面已有分类标签', 'Memory Manager');
+        return;
+    }
+
+    const hasApi = s.useSecondaryApi && s.secondaryApiUrl && s.secondaryApiKey;
+    if (!hasApi) {
+        toastr?.warning?.('需要副API来分析页面内容并分配分类', 'Memory Manager');
+        return;
+    }
+
+    toastr?.info?.(`正在为${pagesNeedingCats.length}个页面分配分类标签...`, 'Memory Manager');
+
+    const validCats = Object.keys(MEMORY_CATEGORIES);
+    const catDesc = validCats.map(c => `${c}(${MEMORY_CATEGORIES[c]})`).join(', ');
+
+    let assigned = 0;
+    // Process in batches of 5 to reduce API calls
+    const batchSize = 5;
+    for (let i = 0; i < pagesNeedingCats.length; i += batchSize) {
+        const batch = pagesNeedingCats.slice(i, i + batchSize);
+        const batchPrompt = batch.map(p =>
+            `[${p.id}] ${p.day} | ${p.title}\n内容: ${(p.content || '').substring(0, 200)}`,
+        ).join('\n\n');
+
+        try {
+            const result = await callSecondaryApi(
+                null,
+                `为以下故事页面分配语义分类标签。每个页面分配1-3个最相关的分类。
+
+可用分类: ${catDesc}
+
+## 页面
+${batchPrompt}
+
+回复格式（严格JSON数组）:
+[{"id":"页面ID","categories":["cat1","cat2"]}]
+
+只输出JSON，不要其他文字。`,
+                300,
+            );
+
+            const parsed = parseJsonResponse(result);
+            if (Array.isArray(parsed)) {
+                for (const item of parsed) {
+                    const page = data.pages.find(p => p.id === item.id);
+                    if (page && Array.isArray(item.categories)) {
+                        page.categories = item.categories.filter(c => VALID_CATEGORIES.has(c));
+                        if (page.categories.length > 0) assigned++;
+                    }
+                }
+            }
+        } catch (err) {
+            warn('Category assignment batch failed:', err);
+        }
+    }
+
+    saveMemoryData();
+    toastr?.success?.(`分类标签分配完成: ${assigned}/${pagesNeedingCats.length} 页已分类`, 'Memory Manager');
+    updateBrowserUI();
+}
+
+// ============================================================
+//  JSON Parsing (kept from v3)
+// ============================================================
+
+function parseJsonResponse(text) {
+    if (!text || typeof text !== 'string') {
+        warn('parseJsonResponse: received non-string input:', typeof text, text);
+        return null;
+    }
+
+    log('parseJsonResponse: input length =', text.length, 'preview:', text.substring(0, 150));
+
+    // Strategy 1: markdown code block (greedy)
+    const blockMatch = text.match(/```(?:json)?\s*\n?([\s\S]+)\n?\s*```/);
+    if (blockMatch) {
+        const raw = blockMatch[1].trim();
+        log('Strategy 1: code block found, inner length =', raw.length);
+        const fixed = fixJsonString(raw);
+        try {
+            const result = JSON.parse(fixed);
+            log('Strategy 1: parse SUCCESS, keys:', Object.keys(result));
+            return result;
+        } catch (e) {
+            warn('Strategy 1: code block parse failed:', e.message);
+        }
+    }
+
+    // Strategy 2: bare JSON object (outermost braces)
+    const braceStart = text.indexOf('{');
+    const braceEnd = text.lastIndexOf('}');
+    if (braceStart !== -1 && braceEnd > braceStart) {
+        const raw = text.substring(braceStart, braceEnd + 1);
+        log('Strategy 2: bare JSON found, length =', raw.length);
+        const fixed = fixJsonString(raw);
+        try {
+            const result = JSON.parse(fixed);
+            log('Strategy 2: parse SUCCESS, keys:', Object.keys(result));
+            return result;
+        } catch (e) {
+            warn('Strategy 2: bare JSON parse failed:', e.message);
+        }
+    }
+
+    // Strategy 3: aggressive fix — smart/curly quotes
+    {
+        const braceMatch = text.match(/\{[\s\S]*\}/);
+        if (braceMatch) {
+            let raw = braceMatch[0];
+            raw = raw.replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '\\"');
+            raw = raw.replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "\\'");
+            const fixed = fixJsonString(raw);
+            try {
+                const result = JSON.parse(fixed);
+                log('Strategy 3: aggressive fix SUCCESS, keys:', Object.keys(result));
+                return result;
+            } catch (e) {
+                warn('Strategy 3: aggressive fix also failed:', e.message);
+            }
+        }
+    }
+
+    warn('Could not parse JSON from response. First 500 chars:', text.substring(0, 500));
+    return null;
+}
+
+function fixJsonString(raw) {
+    let result = '';
+    let inString = false;
+    let escaped = false;
+
+    for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+
+        if (escaped) {
+            result += ch;
+            escaped = false;
+            continue;
+        }
+
+        if (ch === '\\' && inString) {
+            result += ch;
+            escaped = true;
+            continue;
+        }
+
+        if (ch === '"') {
+            if (!inString) {
+                inString = true;
+                result += ch;
+            } else {
+                // Peek ahead to decide: closing quote or content quote
+                let j = i + 1;
+                while (j < raw.length && (raw[j] === ' ' || raw[j] === '\t')) j++;
+                const next = raw[j];
+                if (next === ':' || next === ',' || next === '}' || next === ']'
+                    || next === '\n' || next === '\r' || next === undefined) {
+                    inString = false;
+                    result += ch;
+                } else {
+                    result += '\\"';
+                }
+            }
+            continue;
+        }
+
+        if (inString) {
+            if (ch === '\n') { result += '\\n'; continue; }
+            if (ch === '\r') { continue; }
+            if (ch === '\t') { result += '\\t'; continue; }
+        }
+
+        result += ch;
+    }
+
+    result = result.replace(/,\s*([}\]])/g, '$1');
+    return result;
+}
+
+// ============================================================
+//  Story Index Formatting (for injection — compact, bounded)
+// ============================================================
+
+/**
+ * Format the compact story index for injection.
+ * Only timeline + items. Characters are fully on-demand via tool calling.
+ * Target: ~400-600 tokens maximum.
+ */
+function formatStoryIndex(data) {
+    const parts = ['[故事索引]'];
+    const ctx = getContext();
+    const userName = ctx.name1 || '{{user}}';
+
+    // Timeline (compact)
+    if (data.timeline) {
+        parts.push('一、剧情时间线');
+        parts.push(data.timeline);
+    }
+
+    // Item index (compact)
+    if (data.items.length > 0) {
+        parts.push('\n二、物品');
+        for (const item of data.items) {
+            parts.push(`· ${item.name} | ${item.status || ''}`);
+        }
+    }
+
+    // Known character attitudes (always show all)
+    if (data.knownCharacterAttitudes && data.knownCharacterAttitudes.length > 0) {
+        parts.push(`\n三、已有角色对${userName}态度/关系`);
+        for (const c of data.knownCharacterAttitudes) {
+            if (c.attitude) {
+                parts.push(`· ${c.name}: ${c.attitude}`);
+            }
+        }
+    }
+
+    // NPC character names (dossiers are on-demand)
+    if (data.characters.length > 0) {
+        const names = data.characters.map(c => c.name).join('、');
+        parts.push(`\n四、已登场NPC: ${names}`);
+    }
+
+    parts.push('[/故事索引]');
+    return parts.join('\n');
+}
+
+/**
+ * Format selected pages for injection (recalled content).
+ */
+function formatRecalledPages(pages) {
+    if (pages.length === 0) return '';
+
+    const parts = ['[记忆闪回]'];
+    for (const page of pages) {
+        parts.push(`回忆起了……「${page.title}」(${page.day})`);
+        parts.push(page.content);
+        parts.push('');
+    }
+    parts.push('[/记忆闪回]');
+    return parts.join('\n');
+}
+
+/**
+ * Format character dossier for injection when character is relevant.
+ */
+function formatDossier(character) {
+    const parts = [];
+    parts.push(`[角色档案: ${character.name}]`);
+    if (character.appearance) parts.push(`外貌: ${character.appearance}`);
+    if (character.personality) parts.push(`性格: ${character.personality}`);
+    if (character.attitude) parts.push(`对主角态度: ${character.attitude}`);
+    parts.push(`[/角色档案]`);
+    return parts.join('\n');
+}
+
+// ============================================================
+//  Extraction Engine
+// ============================================================
+
+function buildExtractionPrompt(data, newMessages) {
+    const ctx = getContext();
+    const userName = ctx.name1 || '{{user}}';
+    const knownNames = getKnownCharacterNames();
+    const knownCharNamesStr = knownNames.size > 0 ? [...knownNames].join('、') : '（无）';
+
+    const knownAttJson = data.knownCharacterAttitudes.length > 0
+        ? JSON.stringify(data.knownCharacterAttitudes, null, 2)
+        : '[]';
+    const charsJson = data.characters.length > 0
+        ? JSON.stringify(data.characters, null, 2)
+        : '[]';
+    const itemsJson = data.items.length > 0
+        ? JSON.stringify(data.items, null, 2)
+        : '[]';
+
+    return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。
+## 任务
+
+### 1. 更新时间线
+基于现有时间线和新消息，输出更新后的完整时间线。
+格式规则:
+- 每行格式 "D{天数}: 短句"，每行不超过30字
+- 旧事件合并为 "D{起}-D{止}: 一句话概括"，不超过30字
+- 像书的目录一样简洁，只写关键转折
+- 保留旧条目的核心信息（大幅压缩措辞）
+- 按时间线排列，控制在15行以内
+- 示例: "D1: 纽约初遇，自由女神像约会" "D2-D4: 共同调查失踪案，发现线索"
+
+### 2. 更新角色信息
+分两类输出：
+
+**已知角色**（${knownCharNamesStr}）— 只更新态度：
+  输出到 knownCharacterAttitudes 数组，每项: {name, attitude}
+  attitude: 该角色对主角（${userName}）的态度/关系变化轨迹
+
+**新NPC角色**（不含主角"${userName}"、不含已知角色）：
+  输出到 newCharacters 数组，每项: {name, appearance, personality, attitude}
+  仅收录剧情中新登场的、非已知角色列表中的NPC
+
+### 3. 更新重要物品
+如果有物品变动，更新物品列表。
+每个物品: name, status, significance
+
+### 4. 提取故事页（Story Pages）
+从消息中提取值得记录的事件。每个页面是一个完整事件的因果记录。
+不仅限于重大转折，任何改变事件走向、揭示关键信息、推动关系变化的事件都应记录。
+日常噪音（补妆、移动、整理仪容等不影响剧情的动作）不记录。
+
+每个页面包含:
+- title: 短标题（4-8字）
+- day: 对应时间线中的D几
+- content: 以事件为单位，记录因果链（50-150字）。规则：
+  · 写"为什么"而非仅写"做了什么"（因果关系优先）
+    ❌ "她典当了项链，去买了衣服"
+    ✅ "她卖掉母亲留下的项链，换钱为他买面试穿的西装"
+  · 按事件组织，不按分钟组织。一个事件=起因→经过→结果
+    ❌ "08:14 A摔门 → 08:17 A哭泣 → 08:22 A喊哥哥"
+    ✅ "[清晨] A说出全名后情绪崩溃离开，B追出安抚，C目睹后放弃审讯姿态"
+  · 可记录1-2句决定事件走向的关键对话（用概括语言，禁止大段引用原文台词）
+  · 使用时间段（清晨/上午/下午/傍晚/深夜），禁止精确到分钟
+  · 不要文学修饰和感官细节渲染
+- keywords: 用于检索的关键词数组（3-8个，含角色名、地点、物品、情感关键词）
+- categories: 语义分类标签数组，从以下选择1-3个:
+    "emotional"(情感事件), "relationship"(关系变化),
+    "intimate"(亲密互动), "promise"(承诺/约定),
+    "conflict"(冲突/争执), "discovery"(发现/揭秘),
+    "turning_point"(重大转折), "daily"(日常片段)
+- significance: "high"（重要转折/关系变化）或 "medium"（值得记住但非关键）
+
+如果没有值得记录的事件，newPages为空数组。
+
+现在开始，请分析以下新消息，完成记忆提取。
+## 当前故事索引
+
+### 剧情时间线
+${data.timeline || '（尚无，请从头创建）'}
+
+### 已知角色态度（当前）
+${knownAttJson}
+
+### NPC角色档案（当前）
+${charsJson}
+
+### 重要物品（当前）
+${itemsJson}
+
+## 新消息内容
+${newMessages}
+
+
+
+## 输出格式
+严格按以下JSON格式输出，用markdown代码块包裹：
+
+\`\`\`json
+{
+  "timeline": "D1: 短句\\nD2: 短句",
+  "knownCharacterAttitudes": [
+    {"name": "...", "attitude": "..."}
+  ],
+  "newCharacters": [
+    {"name": "...", "appearance": "...", "personality": "...", "attitude": "..."}
+  ],
+  "items": [
+    {"name": "...", "status": "...", "significance": "..."}
+  ],
+  "newPages": [
+    {
+      "title": "...",
+      "day": "D1",
+      "content": "...",
+      "keywords": ["...", "..."],
+      "categories": ["emotional", "relationship"],
+      "significance": "high"
+    }
+  ]
+}
+\`\`\`
+
+注意：
+- 只输出JSON代码块，不要有其他文字
+- 角色名使用实际名字，不用{{char}}或{{user}}
+- knownCharacterAttitudes 只含已知角色（${knownCharNamesStr}）
+- newCharacters 不含主角"${userName}"和已知角色
+- items要输出完整列表（含未变化的旧条目）
+- newPages仅包含本批消息中提取的新页面
+- categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
+- 时间线每行不超过30字，像目录一样简洁
+]`;
+}
+
+function buildInitExtractionPrompt(data, messages) {
+    const ctx = getContext();
+    const userName = ctx.name1 || '{{user}}';
+    const knownNames = getKnownCharacterNames();
+    const knownCharNamesStr = knownNames.size > 0 ? [...knownNames].join('、') : '（无）';
+
+    const knownAttJson = data.knownCharacterAttitudes.length > 0
+        ? JSON.stringify(data.knownCharacterAttitudes, null, 2)
+        : '[]';
+    const charsJson = data.characters.length > 0
+        ? JSON.stringify(data.characters, null, 2)
+        : '[]';
+    const itemsJson = data.items.length > 0
+        ? JSON.stringify(data.items, null, 2)
+        : '[]';
+
+    return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。以下是你的任务要求
+
+    ## 剧情记忆管理任务
+
+### 1. 更新时间线
+将本批内容中的事件整合进时间线。
+格式规则:
+- 每行格式 "D{天数}: 短句"，每行不超过30字
+- 旧事件合并为 "D{起}-D{止}: 一句话概括"，不超过30字
+- 像书的目录一样简洁，只写关键转折
+- 保留旧条目核心信息
+- 按时间线排列，控制在15行以内
+- 示例: "D1: 纽约初遇，自由女神像约会"
+
+### 2. 更新角色信息
+分两类输出：
+
+**已知角色**（${knownCharNamesStr}）— 只更新态度：
+  输出到 knownCharacterAttitudes 数组，每项: {name, attitude}
+  attitude: 该角色对主角（${userName}）的态度/关系变化轨迹
+  禁止忽略此项！
+
+**新NPC角色**（不含主角"${userName}"、不含已知角色）：
+  输出到 newCharacters 数组，每项: {name, appearance, personality, attitude}
+
+### 3. 更新重要物品
+每个物品: name, status, significance
+
+### 4. 提取故事页（重要！）
+这是初始化流程。为本批内容中所有值得记录的事件创建故事页。
+即使这些事件已经反映在时间线中，仍然需要创建对应的故事页。
+任何改变事件走向、揭示关键信息、推动关系变化的事件都应有一页。
+日常噪音（补妆、移动、整理仪容等不影响剧情的动作）不记录。
+
+每页包含:
+- title: 短标题（4-8字）
+- day: 对应时间线中的D几
+- content: 以事件为单位，记录因果链（50-150字）。规则：
+  · 写"为什么"而非仅写"做了什么"（因果关系优先）
+    ❌ "她典当了项链，去买了衣服"
+    ✅ "她卖掉母亲留下的项链，换钱为他买面试穿的西装"
+  · 按事件组织，不按分钟组织。一个事件=起因→经过→结果
+  · 可记录1-2句决定事件走向的关键对话（概括语言，禁止大段引用原文台词）
+  · 使用时间段（清晨/上午/下午/傍晚/深夜），禁止精确到分钟
+  · 不要文学修饰和感官细节渲染
+- keywords: 关键词数组（3-8个）
+- categories: 语义分类标签数组，从以下选择1-3个:
+    "emotional"(情感事件), "relationship"(关系变化),
+    "intimate"(亲密互动), "promise"(承诺/约定),
+    "conflict"(冲突/争执), "discovery"(发现/揭秘),
+    "turning_point"(重大转折), "daily"(日常片段)
+- significance: "high" 或 "medium"
+
+
+
+注意：
+- 只输出JSON代码块，不要有其他文字
+- 角色名使用实际名字
+- knownCharacterAttitudes 只含已知角色（${knownCharNamesStr}）
+- newCharacters 不含主角"${userName}"和已知角色
+- items要输出完整列表
+- newPages要为每个值得记录的事件都创建，不要遗漏
+- categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
+- 时间线每行不超过30字，像目录一样简洁
+
+---
+以下是本批内容：
+## 当前故事索引（由之前的批次积累）
+
+### 剧情时间线
+${data.timeline || '（尚无，请从头创建）'}
+
+### 已知角色态度（当前）
+${knownAttJson}
+
+### NPC角色档案（当前）
+${charsJson}
+
+### 重要物品（当前）
+${itemsJson}
+
+## 本批内容
+${messages}
+
+# 现在开始按照输出格式输出
+## 输出格式
+严格按JSON格式输出，用markdown代码块包裹：
+
+\`\`\`json
+{
+  "timeline": "D1: 短句\\nD2: 短句",
+  "knownCharacterAttitudes": [
+    {"name": "...", "attitude": "..."}
+  ],
+  "newCharacters": [
+    {"name": "...", "appearance": "...", "personality": "...", "attitude": "..."}
+  ],
+  "items": [
+    {"name": "...", "status": "...", "significance": "..."}
+  ],
+  "newPages": [
+    {
+      "title": "...",
+      "day": "D1",
+      "content": "...",
+      "keywords": ["...", "..."],
+      "categories": ["emotional", "relationship"],
+      "significance": "high"
+    }
+  ]
+}
+\`\`\`
+]`;
+}
+
+function applyExtractionResult(data, result) {
+    // Update timeline
+    if (result.timeline) {
+        data.timeline = result.timeline;
+    }
+
+    const ctx = getContext();
+    const userName = (ctx.name1 || '').trim().toLowerCase();
+    const knownNames = getKnownCharacterNames();
+    const knownLower = new Set([...knownNames].map(n => n.toLowerCase()));
+
+    // Update known character attitudes (new format)
+    if (Array.isArray(result.knownCharacterAttitudes) && result.knownCharacterAttitudes.length > 0) {
+        for (const incoming of result.knownCharacterAttitudes) {
+            if (!incoming.name) continue;
+            // Only accept characters actually in the known list
+            if (!knownLower.has(incoming.name.trim().toLowerCase())) continue;
+            const existing = data.knownCharacterAttitudes.find(
+                k => k.name.toLowerCase() === incoming.name.trim().toLowerCase(),
+            );
+            if (existing) {
+                if (incoming.attitude) existing.attitude = incoming.attitude;
+            } else {
+                data.knownCharacterAttitudes.push({
+                    name: incoming.name.trim(),
+                    attitude: incoming.attitude || '',
+                });
+            }
+        }
+    }
+
+    // Update new NPC characters (new format)
+    if (Array.isArray(result.newCharacters) && result.newCharacters.length > 0) {
+        data.characters = result.newCharacters
+            .filter(c => c.name
+                && c.name.trim().toLowerCase() !== userName
+                && !knownLower.has(c.name.trim().toLowerCase()),
+            )
+            .map(c => ({
+                name: c.name || '',
+                appearance: c.appearance || '',
+                personality: c.personality || '',
+                attitude: c.attitude || '',
+            }));
+    }
+
+    // Backward compatibility: if LLM returns old "characters" array instead of split format
+    if (Array.isArray(result.characters) && !result.newCharacters) {
+        for (const c of result.characters) {
+            if (!c.name || c.name.trim().toLowerCase() === userName) continue;
+            const attitude = c.attitude || c.relationship || '';
+            if (knownLower.has(c.name.trim().toLowerCase())) {
+                // Known character → update attitude only
+                const existing = data.knownCharacterAttitudes.find(
+                    k => k.name.toLowerCase() === c.name.trim().toLowerCase(),
+                );
+                if (existing) {
+                    if (attitude) existing.attitude = attitude;
+                } else {
+                    data.knownCharacterAttitudes.push({
+                        name: c.name.trim(),
+                        attitude: attitude,
+                    });
+                }
+            } else {
+                // NPC character
+                const existingIdx = data.characters.findIndex(
+                    ch => ch.name.toLowerCase() === c.name.trim().toLowerCase(),
+                );
+                const charData = {
+                    name: c.name || '',
+                    appearance: c.appearance || '',
+                    personality: c.personality || '',
+                    attitude: attitude,
+                };
+                if (existingIdx >= 0) {
+                    data.characters[existingIdx] = charData;
+                } else {
+                    data.characters.push(charData);
+                }
+                embedCharacter(charData).catch(() => {});
+            }
+        }
+    }
+
+    // Update items
+    if (Array.isArray(result.items)) {
+        data.items = result.items.map(item => ({
+            name: item.name || '',
+            status: item.status || '',
+            significance: item.significance || '',
+        }));
+    }
+
+    // Add new pages
+    const newPageIds = [];
+    if (Array.isArray(result.newPages)) {
+        for (const page of result.newPages) {
+            if (!page.title || !page.content || page.content.length < 10) continue;
+            const keywords = Array.isArray(page.keywords) ? page.keywords : [];
+            if (keywords.length < 1) continue;
+
+            // Extract character names from keywords
+            const charNames = data.characters.map(c => c.name);
+            const pageChars = keywords.filter(k => charNames.includes(k));
+
+            // Validate and filter categories
+            const rawCategories = Array.isArray(page.categories) ? page.categories : [];
+            const categories = rawCategories.filter(c => VALID_CATEGORIES.has(c));
+
+            const newId = generateId('pg');
+            data.pages.push({
+                id: newId,
+                day: page.day || '',
+                title: page.title,
+                content: page.content,
+                keywords: keywords,
+                characters: pageChars,
+                categories: categories,
+                significance: page.significance || 'medium',
+                compressionLevel: COMPRESS_FRESH,
+                sourceMessages: [],
+                createdAt: Date.now(),
+                compressedAt: null,
+            });
+            newPageIds.push(newId);
+        }
+    }
+    return newPageIds;
+}
+
+async function performExtraction() {
+    const ctx = getContext();
+    const data = getMemoryData();
+    const lastId = data.processing.lastExtractedMessageId;
+
+    const startIdx = Math.max(0, lastId + 1);
+    const chat = ctx.chat;
+    if (startIdx >= chat.length) return;
+
+    const newMsgs = chat.slice(startIdx)
+        .filter(m => !m.is_system)
+        .map(m => `${m.name}: ${m.mes}`)
+        .join('\n\n');
+
+    if (!newMsgs.trim()) return;
+
+    log('Extracting from messages', startIdx, 'to', chat.length - 1);
+
+    const prompt = buildExtractionPrompt(data, newMsgs);
+    const response = await callLLM(
+        '你是剧情记忆管理系统。严格按要求输出JSON。',
+        prompt,
+        getSettings().extractionMaxTokens,
+    );
+
+    log('Extraction response length:', response?.length);
+
+    const result = parseJsonResponse(response);
+    if (!result) {
+        throw new Error('Failed to parse extraction response');
+    }
+
+    applyExtractionResult(data, result);
+
+    data.processing.lastExtractedMessageId = chat.length - 1;
+    saveMemoryData();
+
+    log('Extraction complete. Pages:', data.pages.length, 'Timeline updated.');
+
+    // Embed newly created pages
+    if (isEmbeddingConfigured()) {
+        const newPages = data.pages.filter(p => !data.embeddings[p.id] && p.compressionLevel <= COMPRESS_SUMMARY);
+        for (const page of newPages) {
+            await embedPage(page);
+        }
+    }
+
+    // Run compression cycle after extraction (checks individual toggles internally)
+    await safeCompress(false);
+
+    // Auto-save to slot after extraction
+    await autoSaveIfEnabled();
+
+    updateBrowserUI();
+}
+
+let consecutiveFailures = 0;
+
+async function safeExtract(force = false) {
+    const s = getSettings();
+    if (!s.enabled && !force) return;
+
+    const data = getMemoryData();
+    if (data.processing.extractionInProgress) {
+        log('Extraction already in progress, skipping');
+        return;
+    }
+
+    const ctx = getContext();
+    if (!ctx.chat || ctx.chat.length === 0) return;
+
+    const pendingCount = ctx.chat.length - 1 - data.processing.lastExtractedMessageId;
+    if (!force && pendingCount < s.extractionInterval) return;
+
+    if (is_send_press) {
+        log('Send in progress, deferring extraction');
+        return;
+    }
+
+    data.processing.extractionInProgress = true;
+    saveMemoryData();
+    setMood('thinking');
+
+    try {
+        await performExtraction();
+        consecutiveFailures = 0;
+        setMood('joyful', 5000);
+        await hideProcessedMessages();
+    } catch (err) {
+        warn('Extraction failed:', err);
+        setMood('sad', 5000);
+        consecutiveFailures++;
+        if (consecutiveFailures >= 3) {
+            toastr?.warning?.('记忆提取连续失败，请检查API状态', 'Memory Manager');
+            consecutiveFailures = 0;
+        }
+    } finally {
+        data.processing.extractionInProgress = false;
+        saveMemoryData();
+        updateStatusDisplay();
+    }
+}
+
+// ============================================================
+//  Compression Engine (Progressive Compression)
+// ============================================================
+
+/**
+ * Build prompt to compress a page from L0 (fresh) to L1 (summary).
+ */
+function buildPageCompressionPrompt(page) {
+    return `[OOC: 将以下故事事件压缩为30-50字的精炼摘要。保留：谁、做了什么、为什么、结果如何。去除感官细节和修辞。
+
+原文 (${page.day} - ${page.title}):
+${page.content}
+
+要求:
+- 输出纯文本，不要JSON不要代码块
+- 30-50字
+- 保留因果关系和关键角色
+- 不要丢失核心事实
+]`;
+}
+
+/**
+ * Build prompt to compress the timeline when it's too long.
+ */
+function buildTimelineCompressionPrompt(timeline, maxEntries) {
+    return `[OOC: 以下剧情时间线条目过多，请压缩。
+
+## 当前时间线
+${timeline}
+
+## 压缩规则
+1. 最近5个条目保持不变
+2. 更早的条目: 相邻的连续天数合并为范围 "D{起}-D{止}: 综合概括"
+3. 合并后的条目用不超过30字的短句概括该段时期的核心事件
+4. 压缩后总行数不超过 ${maxEntries} 行
+5. 不丢失任何重要转折点或关系变化
+6. 每行不超过30字，像书的目录一样简洁
+
+## 输出
+只输出压缩后的时间线文本，每行一条。不要JSON，不要代码块，不要解释。
+]`;
+}
+
+/**
+ * Compress a single page from L0 to L1.
+ */
+async function compressPage(data, pageId) {
+    const page = data.pages.find(p => p.id === pageId);
+    if (!page || page.compressionLevel !== COMPRESS_FRESH) return;
+
+    log('Compressing page:', page.title, '(', page.content.length, 'chars )');
+
+    try {
+        const prompt = buildPageCompressionPrompt(page);
+        const compressed = await callLLM(
+            '你是文本压缩助手。只输出压缩结果。',
+            prompt,
+            200,
+        );
+
+        if (compressed && compressed.trim().length > 10) {
+            page.content = compressed.trim();
+            page.compressionLevel = COMPRESS_SUMMARY;
+            page.compressedAt = Date.now();
+            log('Page compressed:', page.title, '→', page.content.length, 'chars');
+
+            // Re-embed after compression (content changed)
+            if (getSettings().useEmbedding && isEmbeddingConfigured()) {
+                try { await embedPage(page); } catch (_) { /* non-critical */ }
+            }
+        }
+    } catch (err) {
+        warn('Failed to compress page:', page.title, err);
+    }
+}
+
+/**
+ * Archive a page (L1 → L2): its info is already in timeline, delete the page.
+ */
+function archivePage(data, pageId) {
+    const idx = data.pages.findIndex(p => p.id === pageId);
+    if (idx === -1) return;
+
+    const page = data.pages[idx];
+    if (page.compressionLevel < COMPRESS_SUMMARY) return;
+
+    log('Archiving page:', page.title);
+    data.pages.splice(idx, 1);
+
+    // Clean up embedding
+    if (data.embeddings) delete data.embeddings[pageId];
+
+    // Clean up messageRecalls referencing this page
+    for (const [msgId, ids] of Object.entries(data.messageRecalls)) {
+        const filtered = ids.filter(id => id !== pageId);
+        if (filtered.length === 0) {
+            delete data.messageRecalls[msgId];
+        } else {
+            data.messageRecalls[msgId] = filtered;
+        }
+    }
+}
+
+/**
+ * Compress timeline text when it exceeds maxTimelineEntries.
+ */
+async function compressTimeline(data) {
+    const s = getSettings();
+    const lines = data.timeline.split('\n').filter(l => l.trim());
+
+    if (lines.length <= s.maxTimelineEntries) return;
+
+    log('Timeline has', lines.length, 'entries, compressing to', s.maxTimelineEntries);
+
+    try {
+        const prompt = buildTimelineCompressionPrompt(data.timeline, s.maxTimelineEntries);
+        const compressed = await callLLM(
+            '你是时间线压缩助手。只输出压缩后的时间线。',
+            prompt,
+            1000,
+        );
+
+        if (compressed && compressed.trim().length > 20) {
+            const newLines = compressed.trim().split('\n').filter(l => l.trim());
+            if (newLines.length <= lines.length) {
+                data.timeline = compressed.trim();
+                log('Timeline compressed:', lines.length, '→', newLines.length, 'entries');
+            } else {
+                warn('Timeline compression produced more lines, keeping original');
+            }
+        }
+    } catch (err) {
+        warn('Failed to compress timeline:', err);
+    }
+}
+
+/**
+ * Run a full compression cycle.
+ */
+async function runCompressionCycle(data, force = false) {
+    const s = getSettings();
+    const anyEnabled = s.compressTimeline || s.compressPages || s.archiveDaily;
+    if (!anyEnabled && !force) return;
+
+    log('Running compression cycle...');
+
+    // 1. Compress timeline if too long
+    if (s.compressTimeline || force) {
+        await compressTimeline(data);
+    }
+
+    // 2. Compress old L0 pages to L1 (optional)
+    if (s.compressPages || force) {
+        const freshPages = data.pages
+            .filter(p => p.compressionLevel === COMPRESS_FRESH)
+            .sort((a, b) => a.createdAt - b.createdAt);
+
+        if (freshPages.length > s.compressAfterPages) {
+            const toCompress = freshPages.slice(0, freshPages.length - s.compressAfterPages);
+            log('Compressing', toCompress.length, 'fresh pages to summary');
+            for (const page of toCompress) {
+                await compressPage(data, page.id);
+                saveMemoryData();
+            }
+        }
+    }
+
+    // 3. Archive daily-only pages when total exceeds threshold (optional)
+    if (s.archiveDaily || force) {
+        const totalPages = data.pages.length;
+        if (totalPages > s.archiveThreshold) {
+            const dailyPages = data.pages
+                .filter(p => p.compressionLevel >= COMPRESS_SUMMARY
+                    && (p.categories || []).length === 1
+                    && p.categories[0] === 'daily')
+                .sort((a, b) => a.createdAt - b.createdAt);
+
+            const excess = totalPages - s.archiveThreshold;
+            const toArchive = dailyPages.slice(0, Math.min(excess, dailyPages.length));
+            if (toArchive.length > 0) {
+                log('Archiving', toArchive.length, 'daily pages (total', totalPages, '>', s.archiveThreshold, ')');
+                for (const page of toArchive) {
+                    archivePage(data, page.id);
+                }
+            }
+        }
+    }
+
+    saveMemoryData();
+    log('Compression cycle complete. Total pages:', data.pages.length);
+}
+
+async function safeCompress(force = false) {
+    try {
+        setMood('angry');
+        const data = getMemoryData();
+        await runCompressionCycle(data, force);
+        setMood('idle');
+        updateBrowserUI();
+        if (force) {
+            toastr?.success?.('压缩完成', 'Memory Manager');
+        }
+    } catch (err) {
+        warn('Compression cycle failed:', err);
+        setMood('sad', 5000);
+        if (force) {
+            toastr?.error?.('压缩失败: ' + err.message, 'Memory Manager');
+        }
+    }
+}
+
+// ============================================================
+//  Auto-hide Processed Messages
+// ============================================================
+
+async function hideProcessedMessages() {
+    const s = getSettings();
+    if (!s.autoHide) return;
+
+    const ctx = getContext();
+    const data = getMemoryData();
+    const lastExtracted = data.processing.lastExtractedMessageId;
+    if (lastExtracted < 0) return;
+
+    const chatLen = ctx.chat.length;
+    const hideUpTo = Math.min(lastExtracted, chatLen - 1 - s.keepRecentMessages);
+    if (hideUpTo < 0) return;
+
+    let hiddenCount = 0;
+    for (let i = 0; i <= hideUpTo; i++) {
+        if (ctx.chat[i] && !ctx.chat[i].is_system) {
+            hiddenCount++;
+        }
+    }
+
+    if (hiddenCount === 0) return;
+
+    log(`Auto-hiding messages 0-${hideUpTo} (keeping last ${s.keepRecentMessages} visible)`);
+    await hideChatMessageRange(0, hideUpTo, false);
+}
+
+
+
+// ============================================================
+//  Retrieval Engine (MemGPT Agent + Embedding + Keyword Fallback)
+// ============================================================
+
+/**
+ * Build agent tools for exploring beyond embedding candidates.
+ * 4 tools: search_by_category, search_by_timerange, search_by_keyword,
+ *          read_story_page
+ */
+function buildAgentTools(data) {
+    const tools = [];
+    const pages = data.pages.filter(p => p.compressionLevel <= COMPRESS_SUMMARY);
+
+    // 1. search_by_category
+    tools.push({
+        type: 'function',
+        function: {
+            name: 'search_by_category',
+            description: '按语义分类搜索记忆页面。分类: emotional(情感), relationship(关系), intimate(亲密), promise(承诺), conflict(冲突), discovery(发现), turning_point(转折), daily(日常)',
+            parameters: {
+                type: 'object',
+                properties: {
+                    category: { type: 'string', enum: Object.keys(MEMORY_CATEGORIES), description: '语义分类' },
+                },
+                required: ['category'],
+            },
+        },
+    });
+
+    // 2. search_by_timerange
+    tools.push({
+        type: 'function',
+        function: {
+            name: 'search_by_timerange',
+            description: '按时间范围搜索记忆页面。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    d1: { type: 'string', description: '起始天数，如 "D3"' },
+                    d2: { type: 'string', description: '结束天数，如 "D7"' },
+                },
+                required: ['d1', 'd2'],
+            },
+        },
+    });
+
+    // 3. search_by_keyword
+    tools.push({
+        type: 'function',
+        function: {
+            name: 'search_by_keyword',
+            description: '按关键词搜索记忆页面标题和关键词。',
+            parameters: {
+                type: 'object',
+                properties: {
+                    keyword: { type: 'string', description: '搜索关键词' },
+                },
+                required: ['keyword'],
+            },
+        },
+    });
+
+    // 4. read_story_page — read full content of a page (for pages NOT in candidates)
+    if (pages.length > 0) {
+        tools.push({
+            type: 'function',
+            function: {
+                name: 'read_story_page',
+                description: '读取一个记忆页面的完整内容。用于读取搜索发现的、不在候选列表中的页面。',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        page_id: { type: 'string', enum: pages.map(p => p.id), description: '故事页ID' },
+                    },
+                    required: ['page_id'],
+                },
+            },
+        });
+    }
+
+    return tools;
+}
+
+/**
+ * Execute agent tool locally and return text result.
+ */
+function executeAgentTool(toolName, args, data) {
+    const pages = data.pages.filter(p => p.compressionLevel <= COMPRESS_SUMMARY);
+    switch (toolName) {
+    case 'search_by_category': {
+        const cat = args.category;
+        const matched = pages.filter(p => Array.isArray(p.categories) && p.categories.includes(cat));
+        if (matched.length === 0) return `没有找到分类为"${MEMORY_CATEGORIES[cat] || cat}"的页面。`;
+        return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+    }
+    case 'search_by_timerange': {
+        const d1 = parseInt((args.d1 || '').replace(/\D/g, '')) || 0;
+        const d2 = parseInt((args.d2 || '').replace(/\D/g, '')) || 9999;
+        const matched = pages.filter(p => {
+            const d = parseInt((p.day || '').replace(/\D/g, '')) || 0;
+            return d >= d1 && d <= d2;
+        });
+        if (matched.length === 0) return `D${d1}-D${d2}之间没有找到页面。`;
+        return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+    }
+    case 'search_by_keyword': {
+        const kw = (args.keyword || '').toLowerCase();
+        const matched = pages.filter(p =>
+            (p.keywords || []).some(k => k.toLowerCase().includes(kw)) || p.title.toLowerCase().includes(kw),
+        );
+        if (matched.length === 0) return `没有找到关键词"${args.keyword}"相关的页面。`;
+        return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+    }
+    case 'read_story_page': {
+        const page = data.pages.find(p => p.id === args.page_id);
+        if (!page) return `页面 ${args.page_id} 不存在。`;
+        const cats = (page.categories || []).map(c => MEMORY_CATEGORIES[c] || c).join(', ') || '无';
+        return `[${page.id}] ${page.day} | ${page.title} | 分类: ${cats}\n${page.content}`;
+    }
+    default:
+        return '未知工具';
+    }
+}
+
+/**
+ * Build agent prompt with candidate pages (full content) and context.
+ */
+function buildAgentPrompt(data, recentText, candidatePages, maxPages) {
+    const allPages = data.pages.filter(p => p.compressionLevel <= COMPRESS_SUMMARY);
+    const candidateIds = new Set((candidatePages || []).map(p => p.id));
+
+    // Candidate pages with full content
+    let candidateSection = '';
+    if (candidatePages && candidatePages.length > 0) {
+        const formatted = candidatePages.map(p => {
+            const cats = (p.categories || []).map(c => MEMORY_CATEGORIES[c] || c).join(', ') || '无';
+            const content = p.content.length > 500 ? p.content.substring(0, 500) + '…' : p.content;
+            return `### [${p.id}] ${p.day} | ${p.title} | 分类: ${cats}\n${content}`;
+        }).join('\n\n');
+        candidateSection = `\n## Embedding候选记忆（按语义相关度排序，完整内容）\n${formatted}`;
+    }
+
+    // Non-candidate pages catalog (titles only, so agent knows what else exists)
+    const otherPages = allPages.filter(p => !candidateIds.has(p.id));
+    let catalogSection = '';
+    if (otherPages.length > 0) {
+        catalogSection = `\n## 其他记忆页面（仅标题，可用搜索工具探索）\n${otherPages.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n')}`;
+    }
+
+    const charList = data.characters.map(c => `  ${c.name}: ${c.attitude || '(未知)'}`).join('\n');
+
+    return `你是记忆代理——角色的海马体。记忆是独立的agent，你就是负责激活大脑记忆神经元的智能体。发送给你的上下文是角色在故事开始后经历的事件的结构性存贮，而你的输出将直接作为[记忆闪回]注入主AI上下文。
+
+# 你的核心价值
+
+向量搜索只能找到"语义相似"的内容。
+你能做到向量搜索做不到的：
+- **因果推理**：A导致B导致C → 所以角色现在会这样反应
+- **情感脉络**：因为X事件带来的创伤 → 角色对Y有阴影
+- **连贯叙事**：把散落的记忆碎片组织成有意义的故事
+
+---
+
+# 决策流程
+
+## Step 1: 扫描当前对话
+识别触发词：
+- 人物？地点？物品？
+- 情绪状态？关系动态？
+- 正在做的选择？
+
+## Step 2: 需要"理解过去"吗？
+问自己：
+- 回应这段对话，需要知道"之前发生过什么"吗？
+- 需要解释"为什么角色会这样"吗？
+- 涉及角色关系的变化原因吗？
+
+**全部是否** → 输出SKIP，结束
+
+## Step 3: 候选记忆够吗？
+看Embedding候选记忆：
+- 能推理出因果链？能写出情感脉络？
+- **够 → 直接写叙事，不调用工具**
+- 有明显的逻辑断裂 → 用工具补充，然后写叙事
+
+---
+
+# SKIP 的情况
+
+- 纯问候："你好"、"早安"、"在吗"
+- 元指令：换模式、调整语气、重新生成
+- 无关话题：与角色/故事/世界观完全无关
+- 即时反应：对刚刚发生的事的直接回应，不涉及过去
+
+---
+
+# 写叙事的情况
+
+- 角色做出选择时（需要理解动机）
+- 遇到认识的人时（需要关系脉络）
+- 回到某个地点时（场景记忆触发）
+- 涉及情感模式时（愤怒/恐惧/渴望的来源）
+- 需要解释"角色会怎么反应"时
+
+---
+
+# 工具调用规则
+
+**默认不调用。候选记忆通常够用。**
+
+仅在以下情况调用：
+1. 对话明确提到某事件/日期/人物，候选记忆里完全没有
+2. 候选记忆有明显因果断裂（知道A和C，不知道B）
+3. "其他记忆页面"标题显示有关键信息，且对当前对话至关重要
+
+**以下理由不够格调用**：
+- "可能有用" ✗
+- "让我确认一下" ✗
+- "补充背景" ✗ （候选记忆的背景够了）
+
+---
+
+# 输出格式
+- 直接输出决策结果，是skip还是需要输出记忆闪回；
+- 根据决策流程直接在内部判断上述情况，不需要将决策流程、思路等写到<think>中
+
+[记忆闪回]
+
+（不多于500字的连贯叙事）
+- 写清事件之间的因果和情感脉络
+- 保留对当前对话重要的具体细节
+- 聚焦当前需要，不面面俱到
+- 不要将## 当前对话中已有的剧情和内容写进叙事里，那些还没有形成长期记忆
+
+来源: pg_xx · pg_yy · pg_zz
+[/记忆闪回]
+
+---
+
+# 上下文
+
+## 故事索引
+${formatStoryIndex(data)}
+
+## Embedding候选记忆（按相关度排序）
+${candidateSection}
+
+## 其他记忆页面（仅标题，可用工具探索）
+${catalogSection}
+
+## NPC角色
+${charList}
+
+## 当前对话
+${recentText}
+# 现在，执行决策流程。`;}
+
+/**
+ * Main agent retrieval: single MemGPT agent with optional tool use.
+ * Returns { narrative, characters, sourcePageIds, skipped }
+ */
+async function agentRetrieve(data, recentText, candidatePages, maxPages) {
+    try {
+        if (data.pages.length === 0) {
+            return { narrative: '', sourcePageIds: [], skipped: true };
+        }
+
+        const tools = buildAgentTools(data);
+        const prompt = buildAgentPrompt(data, recentText, candidatePages, maxPages);
+        const messages = [{ role: 'user', content: prompt }];
+        const maxRounds = 3;
+        let narrative = '';
+
+        log('MemGPT Agent: starting');
+
+        for (let round = 0; round < maxRounds; round++) {
+            log(`Agent round ${round + 1}/${maxRounds}`);
+            let response;
+            try {
+                response = await callSecondaryApiChat(messages, tools, 800);
+            } catch (err) {
+                warn(`Agent round ${round + 1} failed:`, err);
+                break;
+            }
+
+            // No tool calls → text is the final narrative or SKIP
+            if (response.toolCalls.length === 0) {
+                narrative = (response.content || '').trim();
+                log('Agent finished:', narrative.substring(0, 150));
+                break;
+            }
+
+            // Process tool calls — sanitize empty content (API rejects empty string)
+            const assistantMsg = { ...response.rawMessage };
+            if (!assistantMsg.content) delete assistantMsg.content;
+            messages.push(assistantMsg);
+
+            for (const rawTc of response.rawToolCalls) {
+                const name = rawTc.function?.name || '';
+                let args;
+                try {
+                    args = typeof rawTc.function?.arguments === 'string'
+                        ? JSON.parse(rawTc.function.arguments)
+                        : rawTc.function?.arguments || {};
+                } catch (e) { args = {}; }
+
+                const result = executeAgentTool(name, args, data);
+                messages.push({ role: 'tool', tool_call_id: rawTc.id, content: result });
+                log(`  [Round ${round + 1}] ${name}(${JSON.stringify(args).substring(0, 60)}) → ${result.substring(0, 100)}`);
+            }
+
+            // Last round: force text output (no tools)
+            if (round === maxRounds - 1) {
+                try {
+                    const finalResp = await callSecondaryApiChat(messages, [], 800);
+                    narrative = (finalResp.content || '').trim();
+                    log('Agent forced narrative:', narrative.substring(0, 150));
+                } catch (err) {
+                    warn('Agent final round failed:', err);
+                }
+            }
+        }
+
+        // Strip <think>...</think> reasoning blocks (e.g. DeepSeek)
+        narrative = narrative.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+        // SKIP check
+        if (!narrative || narrative.toUpperCase() === 'SKIP') {
+            log('Agent: SKIP');
+            return { narrative: '', sourcePageIds: [], skipped: true };
+        }
+
+        // Extract source page IDs from [来源: pg_xx, pg_yy]
+        const sourcePageIds = [];
+        const sourceMatch = narrative.match(/\[来源[:\uff1a]\s*([^\]]+)\]/);
+        if (sourceMatch) {
+            const ids = sourceMatch[1].split(/[,，\s]+/).filter(s => s.startsWith('pg_'));
+            sourcePageIds.push(...ids);
+            narrative = narrative.replace(/\n?\[来源[:\uff1a][^\]]*\]\s*$/, '').trim();
+        }
+
+        log('Agent narrative:', narrative.length, 'chars, sources:', sourcePageIds);
+        return { narrative, sourcePageIds, skipped: false };
+    } catch (err) {
+        warn('Agent retrieval failed:', err);
+        return { narrative: '', sourcePageIds: [], skipped: false };
+    }
+}
+
+
+/**
+ * Keyword-based fallback retrieval (when no secondary API or tool calling fails).
+ */
+function keywordFallbackRetrieve(data, queryKeywords, maxPages) {
+    const scored = data.pages
+        .filter(p => p.compressionLevel <= COMPRESS_SUMMARY)
+        .map(p => {
+            let score = 0;
+            for (const kw of (p.keywords || [])) {
+                if (queryKeywords.has(kw)) score += 2;
+                for (const q of queryKeywords) {
+                    if (q !== kw && (q.includes(kw) || kw.includes(q))) score += 1;
+                }
+            }
+            if (p.significance === 'high') score += 1;
+            if (p.compressionLevel === COMPRESS_FRESH) score += 0.5;
+            return { page: p, score };
+        })
+        .filter(s => s.score > 0)
+        .sort((a, b) => b.score - a.score);
+
+    const pages = scored.slice(0, maxPages).map(s => s.page);
+
+    // Find relevant characters from selected pages + keyword matches
+    const mentionedChars = new Set();
+    for (const p of pages) {
+        for (const c of (p.characters || [])) mentionedChars.add(c);
+    }
+    // Also check if any character name appears in keywords
+    for (const c of data.characters) {
+        if (queryKeywords.has(c.name)) mentionedChars.add(c.name);
+    }
+    const characters = data.characters.filter(c => mentionedChars.has(c.name)).slice(0, 2);
+
+    return { pages, characters };
+}
+
+function extractQueryKeywords(recentMessages) {
+    const text = recentMessages.map(m => m.mes || '').join(' ');
+    const matches = text.match(/[\u4e00-\u9fff\u3400-\u4dbf]{2,}|[a-zA-Z]{3,}/g) || [];
+    return new Set(matches);
+}
+
+// ============================================================
+//  Injection (generate_interceptor)
+// ============================================================
+
+let lastRecalledPages = [];
+let lastRecalledChars = [];
+let lastNarrative = '';
+
+async function retrieveMemories(chat, contextSize, abort, type) {
+    if (type === 'quiet') return;
+    if (!isAuthorized()) return;
+
+    const s = getSettings();
+    if (!s.enabled) return;
+
+    const data = getMemoryData();
+
+    // Extract recent messages for keyword/name analysis
+    const recentCount = Math.min(5, chat.length);
+    const recentMessages = chat.slice(-recentCount).filter(m => !m.is_system);
+    const recentText = recentMessages.map(m => {
+        let text = m.mes || '';
+        // Extract only <content> tag content for char messages; strip metadata
+        const contentMatch = text.match(/<content>([\s\S]*?)<\/content>/);
+        if (contentMatch) {
+            text = contentMatch[1].trim();
+        } else {
+            // Strip HTML comments (Tidal Memory etc.)
+            text = text.replace(/<!--[\s\S]*?-->/g, '');
+            // Strip <details> blocks
+            text = text.replace(/<details>[\s\S]*?<\/details>/g, '');
+        }
+        return `${m.name}: ${text}`;
+    }).join('\n');
+
+    // === Layer 1: Always inject Story Index (timeline + items + known attitudes + NPC list) ===
+    if (data.timeline || data.items.length > 0 || data.knownCharacterAttitudes.length > 0 || data.characters.length > 0) {
+        const indexText = formatStoryIndex(data);
+        setExtensionPrompt(
+            PROMPT_KEY_INDEX,
+            indexText,
+            extension_prompt_types.IN_CHAT,
+            s.indexDepth,
+            false,
+            extension_prompt_roles.SYSTEM,
+        );
+    } else {
+        setExtensionPrompt(PROMPT_KEY_INDEX, '', extension_prompt_types.IN_CHAT, 0);
+    }
+
+    // === Layer 2 & 3: Retrieve Pages + Character Dossiers ===
+    if (data.pages.length === 0 && data.characters.length === 0) {
+        setExtensionPrompt(PROMPT_KEY_PAGES, '', extension_prompt_types.IN_CHAT, 0);
+        lastNarrative = '';
+        lastRecalledPages = [];
+        lastRecalledChars = [];
+        return;
+    }
+
+    // --- Retrieval flow: Embedding → Agent → Keyword fallback ---
+
+    let narrative = '';
+    let recalledChars = [];
+    let sourcePageIds = [];
+    let agentSkipped = false;
+
+    // Step 1: Embedding pre-filter (if configured)
+    let candidatePages = null;
+    if (s.useEmbedding && isEmbeddingConfigured()) {
+        try {
+            const embResult = await embeddingPreFilter(data, recentText, s.embeddingTopK);
+            if (embResult) {
+                candidatePages = embResult.pages;
+                recalledChars = embResult.characters || [];
+                log('Embedding pre-filter returned', candidatePages.length, 'pages,', recalledChars.length, 'characters');
+            }
+        } catch (embErr) {
+            warn('Embedding pre-filter failed, skipping:', embErr);
+        }
+    }
+
+    // Step 2: MemGPT Agent (if secondary API configured)
+    if (s.useSecondaryApi && s.secondaryApiUrl && s.secondaryApiKey) {
+        const result = await agentRetrieve(data, recentText, candidatePages, s.maxPages);
+        narrative = result.narrative;
+        sourcePageIds = result.sourcePageIds;
+        agentSkipped = result.skipped;
+    }
+
+    // Step 3: Keyword fallback (only if agent not configured or failed without skipping)
+    if (!agentSkipped && !narrative) {
+        const queryKeywords = extractQueryKeywords(recentMessages);
+        log('Keyword fallback, keywords:', [...queryKeywords]);
+        const kwResult = keywordFallbackRetrieve(data, queryKeywords, s.maxPages);
+        if (kwResult.pages.length > 0) {
+            narrative = formatRecalledPages(kwResult.pages);
+            sourcePageIds = kwResult.pages.map(p => p.id);
+        }
+    }
+
+    // Build injection text
+    const injectionParts = [];
+
+    if (narrative) {
+        // Agent narrative: wrap in [记忆闪回] tags
+        // Keyword fallback (formatRecalledPages) already includes the tags
+        if (narrative.startsWith('[记忆闪回]')) {
+            injectionParts.push(narrative);
+        } else {
+            injectionParts.push(`[记忆闪回]\n${narrative}\n[/记忆闪回]`);
+        }
+    }
+
+    if (recalledChars.length > 0) {
+        for (const char of recalledChars) {
+            injectionParts.push(formatDossier(char));
+        }
+    }
+
+    if (injectionParts.length > 0) {
+        setExtensionPrompt(
+            PROMPT_KEY_PAGES,
+            injectionParts.join('\n\n'),
+            extension_prompt_types.IN_PROMPT,
+            0,
+            false,
+            extension_prompt_roles.SYSTEM,
+        );
+    } else {
+        setExtensionPrompt(PROMPT_KEY_PAGES, '', extension_prompt_types.IN_PROMPT, 0);
+    }
+
+    // Store for UI display
+    lastNarrative = narrative;
+    lastRecalledPages = sourcePageIds.map(id => data.pages.find(p => p.id === id)).filter(Boolean);
+    lastRecalledChars = recalledChars;
+    updateRecallFab();
+
+    // Update mood based on recall results
+    const totalRecalled = sourcePageIds.length + recalledChars.length;
+    if (totalRecalled >= 3) {
+        setMood('inlove', 6000);
+    } else if (totalRecalled > 0) {
+        setMood('joyful', 5000);
+    }
+
+    // Record in messageRecalls for the next message
+    const nextMessageId = chat.length;
+    if (sourcePageIds.length > 0) {
+        data.messageRecalls[nextMessageId] = sourcePageIds;
+        saveMemoryData();
+    }
+}
+
+// Register global interceptor
+window['memoryManager_retrieveMemories'] = retrieveMemories;
+
+// ============================================================
+//  Recall Floating Ball (悬浮球)
+// ============================================================
+
+function updateRecallFab() {
+    const fab = document.getElementById('mm_recall_fab');
+    const countEl = document.getElementById('mm_recall_fab_count');
+    if (!fab || !countEl) return;
+
+    const hasContent = lastNarrative || lastRecalledChars.length > 0;
+    if (hasContent) {
+        fab.classList.add('has-recall');
+        const srcCount = lastRecalledPages.length + lastRecalledChars.length;
+        countEl.textContent = srcCount || '✓';
+        countEl.style.display = '';
+    } else {
+        fab.classList.remove('has-recall');
+        countEl.style.display = 'none';
+    }
+
+    updateRecallPanel();
+}
+
+function updateRecallPanel() {
+    const body = document.getElementById('mm_recall_panel_body');
+    if (!body) return;
+
+    if (!lastNarrative && lastRecalledChars.length === 0) {
+        body.innerHTML = '<div class="mm-empty-state">尚无召回内容</div>';
+        return;
+    }
+
+    let html = '';
+
+    if (lastNarrative) {
+        const narrativeEsc = lastNarrative.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+        html += '<div class="mm-recall-panel-section">';
+        html += '<div class="mm-recall-panel-section-title">记忆叙事</div>';
+        html += `<div class="mm-recall-panel-narrative">${narrativeEsc}</div>`;
+
+        if (lastRecalledPages.length > 0) {
+            html += '<div class="mm-recall-panel-sources">来源: ';
+            html += lastRecalledPages.map(p => `${p.day} ${(p.title || '').replace(/</g, '&lt;')}`).join(' · ');
+            html += '</div>';
+        }
+        html += '</div>';
+    }
+
+    if (lastRecalledChars.length > 0) {
+        html += '<div class="mm-recall-panel-section">';
+        html += `<div class="mm-recall-panel-section-title">角色档案 (${lastRecalledChars.length})</div>`;
+        for (const char of lastRecalledChars) {
+            const fields = [];
+            if (char.appearance) fields.push(`<div>外貌: ${char.appearance.replace(/</g, '&lt;')}</div>`);
+            if (char.personality) fields.push(`<div>性格: ${char.personality.replace(/</g, '&lt;')}</div>`);
+            if (char.attitude) fields.push(`<div>态度: ${char.attitude.replace(/</g, '&lt;')}</div>`);
+
+            html += `<div class="mm-recall-panel-char">
+                <div class="mm-recall-panel-char-name">${(char.name || '').replace(/</g, '&lt;')}</div>
+                ${fields.join('')}
+            </div>`;
+        }
+        html += '</div>';
+    }
+
+    body.innerHTML = html;
+}
+
+function bindRecallFab() {
+    // 动态创建悬浮球和面板，直接挂到 body 上
+    if (document.getElementById('mm_recall_fab')) return;
+
+    const fab = document.createElement('div');
+    fab.id = 'mm_recall_fab';
+    fab.className = 'mm-recall-fab';
+    fab.title = '查看本次记忆召回';
+    fab.innerHTML = `
+        <div id="mm_lottie_container" class="mm-lottie-container"></div>
+        <span id="mm_recall_fab_count" class="mm-recall-fab-count" style="display:none">0</span>
+    `;
+    document.body.appendChild(fab);
+
+    const panel = document.createElement('div');
+    panel.id = 'mm_recall_panel';
+    panel.className = 'mm-recall-panel';
+    panel.style.display = 'none';
+    panel.innerHTML = `
+        <div class="mm-recall-panel-header">
+            <span>本次记忆召回</span>
+            <span id="mm_recall_panel_close" class="mm-recall-panel-close">&times;</span>
+        </div>
+        <div id="mm_recall_panel_body" class="mm-recall-panel-body">
+            <div class="mm-empty-state">尚无召回内容</div>
+        </div>
+    `;
+    document.body.appendChild(panel);
+
+    // ── Drag & Snap logic ──
+    let isDragging = false;
+    let dragStartX = 0, dragStartY = 0;
+    let fabStartX = 0, fabStartY = 0;
+    let hasMoved = false;
+
+    function getFabRect() {
+        return fab.getBoundingClientRect();
+    }
+
+    function snapToEdge(animate = true) {
+        const rect = getFabRect();
+        const centerX = rect.left + rect.width / 2;
+        const viewW = window.innerWidth;
+        const viewH = window.innerHeight;
+
+        // Snap to nearest horizontal edge
+        let targetX, targetY;
+        if (centerX < viewW / 2) {
+            targetX = 8; // left edge
+        } else {
+            targetX = viewW - rect.width - 8; // right edge
+        }
+
+        // Clamp vertical position
+        targetY = Math.max(8, Math.min(rect.top, viewH - rect.height - 8));
+
+        if (animate) {
+            fab.style.transition = 'left 0.3s ease, top 0.3s ease';
+            requestAnimationFrame(() => {
+                fab.style.left = targetX + 'px';
+                fab.style.top = targetY + 'px';
+                setTimeout(() => { fab.style.transition = ''; }, 300);
+            });
+        } else {
+            fab.style.left = targetX + 'px';
+            fab.style.top = targetY + 'px';
+        }
+
+        // Save position
+        try {
+            localStorage.setItem('mm_fab_pos', JSON.stringify({ x: targetX, y: targetY }));
+        } catch (_) { /* ignore */ }
+    }
+
+    function onDragStart(clientX, clientY) {
+        isDragging = true;
+        hasMoved = false;
+        dragStartX = clientX;
+        dragStartY = clientY;
+        const rect = getFabRect();
+        fabStartX = rect.left;
+        fabStartY = rect.top;
+        fab.style.transition = '';
+    }
+
+    function onDragMove(clientX, clientY) {
+        if (!isDragging) return;
+        const dx = clientX - dragStartX;
+        const dy = clientY - dragStartY;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
+        if (!hasMoved) return;
+
+        const viewW = window.innerWidth;
+        const viewH = window.innerHeight;
+        const size = fab.offsetWidth;
+        const newX = Math.max(0, Math.min(fabStartX + dx, viewW - size));
+        const newY = Math.max(0, Math.min(fabStartY + dy, viewH - size));
+        fab.style.left = newX + 'px';
+        fab.style.top = newY + 'px';
+    }
+
+    function onDragEnd() {
+        if (!isDragging) return;
+        isDragging = false;
+        if (hasMoved) {
+            snapToEdge(true);
+        }
+    }
+
+    // Mouse events
+    fab.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        onDragStart(e.clientX, e.clientY);
+    });
+    document.addEventListener('mousemove', (e) => onDragMove(e.clientX, e.clientY));
+    document.addEventListener('mouseup', () => onDragEnd());
+
+    // Touch events (mobile)
+    fab.addEventListener('touchstart', (e) => {
+        const t = e.touches[0];
+        onDragStart(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchmove', (e) => {
+        if (!isDragging) return;
+        const t = e.touches[0];
+        onDragMove(t.clientX, t.clientY);
+    }, { passive: true });
+    document.addEventListener('touchend', () => onDragEnd());
+
+    // ── Click / Tap: toggle panel (only if not dragged) ──
+    fab.addEventListener('click', () => {
+        if (hasMoved) return; // was a drag, not a click
+        const isOpen = panel.style.display !== 'none';
+        if (isOpen) {
+            panel.style.display = 'none';
+        } else {
+            updateRecallPanel();
+            // Position panel near the fab
+            const rect = getFabRect();
+            const viewW = window.innerWidth;
+            if (rect.left < viewW / 2) {
+                panel.style.left = rect.left + 'px';
+                panel.style.right = 'auto';
+            } else {
+                panel.style.left = 'auto';
+                panel.style.right = (viewW - rect.right) + 'px';
+            }
+            panel.style.bottom = (window.innerHeight - rect.top + 8) + 'px';
+            panel.style.display = '';
+        }
+    });
+
+    // ── Touch expression: show random expression on touch ──
+    const touchMoods = ['joyful', 'inlove', 'wink'];
+    fab.addEventListener('touchstart', () => {
+        if (currentMood === 'thinking') return; // don't interrupt working states
+        const randomMood = touchMoods[Math.floor(Math.random() * touchMoods.length)];
+        setMood(randomMood, 3000);
+    }, { passive: true });
+
+    document.getElementById('mm_recall_panel_close')?.addEventListener('click', () => {
+        panel.style.display = 'none';
+    });
+
+    // Restore saved position or default to bottom-right
+    try {
+        const saved = JSON.parse(localStorage.getItem('mm_fab_pos'));
+        if (saved && typeof saved.x === 'number') {
+            fab.style.left = saved.x + 'px';
+            fab.style.top = saved.y + 'px';
+        } else {
+            fab.style.right = '24px';
+            fab.style.bottom = '80px';
+        }
+    } catch (_) {
+        fab.style.right = '24px';
+        fab.style.bottom = '80px';
+    }
+
+    // Re-snap on window resize
+    window.addEventListener('resize', () => snapToEdge(false));
+
+    // Initialize Lottie animation
+    loadLottieLib().then(() => setMood('idle'));
+}
+
+// ============================================================
+//  Batch Initialization
+// ============================================================
+
+let initializationInProgress = false;
+
+async function performBatchInitialization() {
+    if (initializationInProgress) {
+        toastr?.warning?.('初始化正在进行中，请耐心等待', 'Memory Manager');
+        return;
+    }
+
+    const ctx = getContext();
+    if (!ctx.chat || ctx.chat.length === 0) {
+        toastr?.warning?.('当前没有聊天记录', 'Memory Manager');
+        return;
+    }
+
+    const confirmed = confirm(
+        '即将从现有聊天记录构建记忆库。\n\n'
+        + '这将：\n'
+        + '• 重置当前的记忆数据\n'
+        + '• 分批处理所有消息（使用副API / 主API）\n'
+        + '• 构建故事索引、故事页和角色档案\n\n'
+        + '如聊天较长，可能需要多次API调用。是否继续？'
+    );
+    if (!confirmed) return;
+
+    initializationInProgress = true;
+    setMood('thinking');
+    const s = getSettings();
+    const CHUNK_SIZE = 20;
+    const initMaxTokens = Math.max(s.extractionMaxTokens, 8192);
+
+    // Reset data
+    const data = getMemoryData();
+    Object.assign(data, createDefaultData());
+    data.processing.extractionInProgress = true;
+    saveMemoryData();
+
+    // Collect all non-system messages
+    const allMessages = ctx.chat
+        .map((m, i) => ({ msg: m, idx: i }))
+        .filter(item => !item.msg.is_system && item.msg.mes);
+
+    // Gather world book context (不含角色卡 — 角色卡是角色设定，不是剧情记忆)
+    updateInitProgressUI(0, 0, '正在读取世界书...');
+    const worldBookContext = await gatherWorldBookContext();
+
+    // Build batch list
+    const batches = [];
+
+    // Batch 0: World book entries (plot summaries etc.)
+    if (worldBookContext && worldBookContext.trim().length > 0) {
+        batches.push({
+            type: 'lore',
+            text: worldBookContext,
+            sourceIds: [],
+            label: '世界书',
+        });
+    }
+
+    // Chat message batches
+    for (let i = 0; i < allMessages.length; i += CHUNK_SIZE) {
+        const chunk = allMessages.slice(i, i + CHUNK_SIZE);
+        batches.push({
+            type: 'chat',
+            text: chunk.map(item => `${item.msg.name}: ${item.msg.mes}`).join('\n\n'),
+            sourceIds: chunk.map(item => item.idx),
+            label: `聊天消息 ${i + 1}-${Math.min(i + CHUNK_SIZE, allMessages.length)}`,
+            lastIdx: chunk[chunk.length - 1].idx,
+        });
+    }
+
+    const totalBatches = batches.length;
+    let successBatches = 0;
+
+    toastr?.info?.(`开始初始化：${worldBookContext ? '含世界书，' : ''}共 ${allMessages.length} 条消息，分 ${totalBatches} 批处理...`, 'Memory Manager', { timeOut: 5000 });
+    updateInitProgressUI(0, totalBatches, '开始处理...');
+
+    try {
+        for (let ci = 0; ci < totalBatches; ci++) {
+            const batch = batches[ci];
+            if (!batch.text.trim()) continue;
+
+            updateInitProgressUI(ci, totalBatches, `正在处理第 ${ci + 1}/${totalBatches} 批 (${batch.label})...`);
+
+            try {
+                const prompt = buildInitExtractionPrompt(data, batch.text);
+                console.warn(LOG_PREFIX, `Batch ${ci + 1} (${batch.label}): calling LLM (max_tokens=${initMaxTokens})...`);
+                const response = await callLLM(
+                    '你是剧情记忆管理系统。严格按要求输出JSON。',
+                    prompt,
+                    initMaxTokens,
+                );
+
+                console.warn(LOG_PREFIX, `Batch ${ci + 1}: LLM responded, length=${response?.length || 0}`);
+
+                const result = parseJsonResponse(response);
+                if (!result) {
+                    warn(`Batch ${ci + 1}: Failed to parse response.`);
+                    continue;
+                }
+
+                console.warn(LOG_PREFIX, `Batch ${ci + 1}: parsed OK — timeline=${!!result.timeline}, chars=${result.characters?.length || 0}, pages=${result.newPages?.length || 0}`);
+
+                applyExtractionResult(data, result);
+
+                // Tag source messages for new pages (only for chat batches)
+                if (batch.type === 'chat' && batch.sourceIds.length > 0) {
+                    const newPages = data.pages.filter(p => p.sourceMessages.length === 0);
+                    for (const p of newPages) {
+                        p.sourceMessages = batch.sourceIds;
+                    }
+                    data.processing.lastExtractedMessageId = batch.lastIdx;
+                }
+
+                saveMemoryData();
+                successBatches++;
+                log(`Batch ${ci + 1}/${totalBatches} done. Pages: ${data.pages.length}`);
+
+            } catch (err) {
+                warn(`Batch ${ci + 1} failed:`, err);
+                toastr?.warning?.(`第 ${ci + 1} 批处理失败: ${err.message}`, 'Memory Manager');
+            }
+        }
+
+        // Auto-hide
+        if (s.autoHide && data.processing.lastExtractedMessageId >= 0) {
+            await hideProcessedMessages();
+        }
+
+        updateInitProgressUI(totalBatches, totalBatches, '初始化完成！');
+        setMood('inlove', 8000);
+        toastr?.success?.(
+            `初始化完成！处理 ${successBatches}/${totalBatches} 批，提取 ${data.pages.length} 个故事页`,
+            'Memory Manager',
+            { timeOut: 8000 },
+        );
+
+    } catch (err) {
+        warn('Batch initialization error:', err);
+        setMood('sad', 6000);
+        toastr?.error?.('初始化过程出错: ' + err.message, 'Memory Manager');
+    } finally {
+        initializationInProgress = false;
+        data.processing.extractionInProgress = false;
+        saveMemoryData();
+        updateBrowserUI();
+        hideInitProgressUI();
+    }
+}
+
+function updateInitProgressUI(current, total, text) {
+    let container = document.getElementById('mm_init_progress');
+    if (!container) return;
+    const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+    container.style.display = 'block';
+    container.innerHTML = `
+        <div class="mm-init-progress-text">${escapeHtml(text)}</div>
+        <div class="mm-init-progress-bar-track">
+            <div class="mm-init-progress-bar-fill" style="width:${pct}%"></div>
+        </div>
+        <div class="mm-init-progress-pct">${pct}%</div>
+    `;
+}
+
+function hideInitProgressUI() {
+    const container = document.getElementById('mm_init_progress');
+    if (container) {
+        setTimeout(() => { container.style.display = 'none'; }, 3000);
+    }
+}
+
+
+// ============================================================
+//  Save Slot UI
+// ============================================================
+
+function refreshSlotListUI() {
+    const charName = getCurrentCharName();
+    const listEl = document.getElementById('mm_slot_list');
+    const currentEl = document.getElementById('mm_current_slot');
+    if (!listEl) return;
+
+    if (!charName) {
+        listEl.innerHTML = '<div class="mm-empty-state">请先选择角色</div>';
+        if (currentEl) currentEl.textContent = '（未选择角色）';
+        return;
+    }
+
+    const slots = listSlots(charName);
+    const activeSlot = getActiveSlotName(charName);
+    if (currentEl) currentEl.textContent = activeSlot || '（未绑定）';
+
+    if (slots.length === 0) {
+        listEl.innerHTML = '<div class="mm-empty-state">暂无存档</div>';
+        return;
+    }
+
+    listEl.innerHTML = slots.map(slot => {
+        const isActive = slot.name === activeSlot;
+        const date = slot.updatedAt ? new Date(slot.updatedAt).toLocaleString() : '未知';
+        return `
+        <div class="mm-slot-card${isActive ? ' mm-slot-active' : ''}" data-slot="${escapeHtml(slot.name)}">
+            <div class="mm-slot-card-header">
+                <span class="mm-slot-card-name">${escapeHtml(slot.name)}</span>
+                ${isActive ? '<span class="mm-slot-badge">当前</span>' : ''}
+            </div>
+            <div class="mm-slot-card-time">${date}</div>
+            <div class="mm-slot-card-actions">
+                ${!isActive ? `<button class="mm-slot-load" data-slot="${escapeHtml(slot.name)}">加载</button>` : ''}
+                <button class="mm-slot-delete mm-btn-danger" data-slot="${escapeHtml(slot.name)}">删除</button>
+            </div>
+        </div>`;
+    }).join('');
+
+    listEl.querySelectorAll('.mm-slot-load').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const slotName = btn.dataset.slot;
+            await loadFromSlot(charName, slotName);
+            toastr.success(`已加载存档「${slotName}」`);
+            refreshSlotListUI();
+            updateBrowserUI();
+        });
+    });
+
+    listEl.querySelectorAll('.mm-slot-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const slotName = btn.dataset.slot;
+            if (!confirm(`确认删除存档「${slotName}」？此操作不可恢复。`)) return;
+            await deleteSlot(charName, slotName);
+            toastr.info(`已删除存档「${slotName}」`);
+            refreshSlotListUI();
+        });
+    });
+}
+
+// ============================================================
+//  Memory Browser UI (Settings Panel)
+// ============================================================
+
+function updateBrowserUI() {
+    const data = getMemoryData();
+
+    // Timeline
+    const timelineEl = document.getElementById('mm_bible_timeline');
+    if (timelineEl) {
+        timelineEl.textContent = data.timeline || '（尚无数据）';
+    }
+
+    // Known Character Attitudes
+    const knownCharsEl = document.getElementById('mm_bible_known_chars');
+    if (knownCharsEl) {
+        if (!data.knownCharacterAttitudes || data.knownCharacterAttitudes.length === 0) {
+            knownCharsEl.innerHTML = '<div class="mm-empty-state">暂无已知角色数据</div>';
+        } else {
+            knownCharsEl.innerHTML = data.knownCharacterAttitudes.map((c, i) =>
+                `<div class="mm-entry-card" data-type="known" data-index="${i}">` +
+                    `<div class="mm-entry-header">` +
+                        `<span class="mm-entry-name">${escapeHtml(c.name)}</span>` +
+                        `<span class="mm-entry-summary">${escapeHtml(c.attitude || '(未设定)')}</span>` +
+                        `<span class="mm-entry-actions">` +
+                            `<button class="mm-entry-btn mm-btn-edit-entry" data-index="${i}">编辑</button>` +
+                            `<button class="mm-entry-btn mm-btn-del-entry" data-index="${i}">删除</button>` +
+                        `</span>` +
+                    `</div>` +
+                    `<div class="mm-entry-edit-panel" style="display:none"></div>` +
+                `</div>`
+            ).join('');
+        }
+        knownCharsEl.querySelectorAll('.mm-btn-edit-entry').forEach(btn => {
+            btn.addEventListener('click', () => openEditKnownChar(Number(btn.dataset.index)));
+        });
+        knownCharsEl.querySelectorAll('.mm-btn-del-entry').forEach(btn => {
+            btn.addEventListener('click', () => onDeleteKnownChar(Number(btn.dataset.index)));
+        });
+    }
+
+    // NPC Characters
+    const charsEl = document.getElementById('mm_bible_characters');
+    if (charsEl) {
+        if (data.characters.length === 0) {
+            charsEl.innerHTML = '<div class="mm-empty-state">暂无NPC数据</div>';
+        } else {
+            charsEl.innerHTML = data.characters.map((c, i) => {
+                const summary = [c.appearance, c.personality, c.attitude].filter(Boolean).join(' · ');
+                return `<div class="mm-entry-card" data-type="npc" data-index="${i}">` +
+                    `<div class="mm-entry-header">` +
+                        `<span class="mm-entry-name">${escapeHtml(c.name)}</span>` +
+                        `<span class="mm-entry-summary">${escapeHtml(summary || '(未设定)')}</span>` +
+                        `<span class="mm-entry-actions">` +
+                            `<button class="mm-entry-btn mm-btn-edit-entry" data-index="${i}">编辑</button>` +
+                            `<button class="mm-entry-btn mm-btn-del-entry" data-index="${i}">删除</button>` +
+                        `</span>` +
+                    `</div>` +
+                    `<div class="mm-entry-edit-panel" style="display:none"></div>` +
+                `</div>`;
+            }).join('');
+        }
+        charsEl.querySelectorAll('.mm-btn-edit-entry').forEach(btn => {
+            btn.addEventListener('click', () => openEditNpcChar(Number(btn.dataset.index)));
+        });
+        charsEl.querySelectorAll('.mm-btn-del-entry').forEach(btn => {
+            btn.addEventListener('click', () => onDeleteNpcChar(Number(btn.dataset.index)));
+        });
+    }
+
+    // Items
+    const itemsEl = document.getElementById('mm_bible_items');
+    if (itemsEl) {
+        if (data.items.length === 0) {
+            itemsEl.innerHTML = '<div class="mm-empty-state">暂无物品数据</div>';
+        } else {
+            itemsEl.innerHTML = data.items.map((item, i) =>
+                `<div class="mm-entry-card" data-type="item" data-index="${i}">` +
+                    `<div class="mm-entry-header">` +
+                        `<span class="mm-entry-name">${escapeHtml(item.name)}</span>` +
+                        `<span class="mm-entry-summary">${escapeHtml(item.status || '')}${item.significance ? ' (' + escapeHtml(item.significance) + ')' : ''}</span>` +
+                        `<span class="mm-entry-actions">` +
+                            `<button class="mm-entry-btn mm-btn-edit-entry" data-index="${i}">编辑</button>` +
+                            `<button class="mm-entry-btn mm-btn-del-entry" data-index="${i}">删除</button>` +
+                        `</span>` +
+                    `</div>` +
+                    `<div class="mm-entry-edit-panel" style="display:none"></div>` +
+                `</div>`
+            ).join('');
+        }
+        itemsEl.querySelectorAll('.mm-btn-edit-entry').forEach(btn => {
+            btn.addEventListener('click', () => openEditItem(Number(btn.dataset.index)));
+        });
+        itemsEl.querySelectorAll('.mm-btn-del-entry').forEach(btn => {
+            btn.addEventListener('click', () => onDeleteItem(Number(btn.dataset.index)));
+        });
+    }
+
+    // Page stats
+    const countEl = document.getElementById('mm_page_count');
+    if (countEl) {
+        countEl.textContent = data.pages.length;
+    }
+
+    const freshCountEl = document.getElementById('mm_fresh_count');
+    if (freshCountEl) {
+        freshCountEl.textContent = data.pages.filter(p => p.compressionLevel === COMPRESS_FRESH).length;
+    }
+
+    const compressedCountEl = document.getElementById('mm_compressed_count');
+    if (compressedCountEl) {
+        compressedCountEl.textContent = data.pages.filter(p => p.compressionLevel === COMPRESS_SUMMARY).length;
+    }
+
+    // Page list
+    const listEl = document.getElementById('mm_page_list');
+    if (listEl) {
+        const allPages = data.pages.sort((a, b) => {
+            // Sort by day then by creation time
+            const dayA = parseInt(a.day?.replace(/\D/g, '') || '0');
+            const dayB = parseInt(b.day?.replace(/\D/g, '') || '0');
+            if (dayA !== dayB) return dayA - dayB;
+            return a.createdAt - b.createdAt;
+        });
+
+        if (allPages.length === 0) {
+            listEl.innerHTML = '<div class="mm-empty-state">暂无故事页</div>';
+        } else {
+            listEl.innerHTML = allPages.map(p => {
+                const levelClass = p.compressionLevel === COMPRESS_FRESH ? 'mm-level-fresh' : 'mm-level-compressed';
+                const levelLabel = p.compressionLevel === COMPRESS_FRESH ? '详细' : '摘要';
+                return `
+                <div class="mm-memory-card ${levelClass}" data-id="${p.id}">
+                    <div class="mm-memory-card-header">
+                        <span class="mm-memory-card-day">${escapeHtml(p.day)}</span>
+                        <span class="mm-memory-card-title">${escapeHtml(p.title)}</span>
+                        <span class="mm-memory-card-sig mm-sig-${p.significance}">
+                            ${p.significance === 'high' ? '!!' : '!'}
+                        </span>
+                        <span class="mm-memory-card-level ${levelClass}">${levelLabel}</span>
+                    </div>
+                    <div class="mm-memory-card-tags">
+                        ${(p.categories || []).map(c => {
+                            const color = CATEGORY_COLORS[c] || '#6b7280';
+                            const label = MEMORY_CATEGORIES[c] || c;
+                            return `<span class="mm-tag mm-cat-tag" style="border-color:${color};color:${color}">${escapeHtml(label)}</span>`;
+                        }).join('')}
+                        ${(p.keywords || []).map(t => `<span class="mm-tag">${escapeHtml(t)}</span>`).join('')}
+                    </div>
+                    <div class="mm-memory-card-body">${escapeHtml(p.content)}</div>
+                    <div class="mm-memory-card-actions">
+                        <button class="mm-btn-edit" data-id="${p.id}">编辑</button>
+                        <button class="mm-btn-danger mm-btn-delete" data-id="${p.id}">删除</button>
+                    </div>
+                </div>
+            `}).join('');
+
+            listEl.querySelectorAll('.mm-btn-delete').forEach(btn => {
+                btn.addEventListener('click', () => onDeletePage(btn.dataset.id));
+            });
+            listEl.querySelectorAll('.mm-btn-edit').forEach(btn => {
+                btn.addEventListener('click', () => onEditPage(btn.dataset.id));
+            });
+        }
+    }
+
+    // Embedding status
+    const embStatusEl = document.getElementById('mm_embedding_status');
+    if (embStatusEl && getSettings().useEmbedding) {
+        const embCount = Object.keys(data.embeddings || {}).length;
+        const totalPages = data.pages.length;
+        embStatusEl.textContent = `已索引: ${embCount} / ${totalPages} 页`;
+    }
+
+    updateStatusDisplay();
+
+    // Refresh save slot list for current character
+    refreshSlotListUI();
+}
+
+function updateStatusDisplay() {
+    const ctx = getContext();
+    const data = getMemoryData();
+    const processed = data.processing.lastExtractedMessageId;
+    const total = ctx.chat ? ctx.chat.length - 1 : 0;
+    const pending = Math.max(0, total - processed);
+
+    const statusEl = document.getElementById('mm_status_text');
+    if (statusEl) {
+        statusEl.textContent = getSettings().enabled ? '运行中' : '已禁用';
+    }
+
+    const processedEl = document.getElementById('mm_processed_count');
+    if (processedEl) processedEl.textContent = Math.max(0, processed);
+
+    const pendingEl = document.getElementById('mm_pending_count');
+    if (pendingEl) pendingEl.textContent = pending;
+}
+
+// ============================================================
+//  Page Edit/Delete/Export/Import
+// ============================================================
+
+async function onDeletePage(id) {
+    const data = getMemoryData();
+    const idx = data.pages.findIndex(p => p.id === id);
+    if (idx === -1) return;
+
+    const page = data.pages[idx];
+    const confirmed = confirm(`确认删除故事页「${page.title}」？`);
+    if (!confirmed) return;
+
+    data.pages.splice(idx, 1);
+    if (data.embeddings) delete data.embeddings[id];
+    saveMemoryData();
+    updateBrowserUI();
+}
+
+async function onEditPage(id) {
+    const data = getMemoryData();
+    const page = data.pages.find(p => p.id === id);
+    if (!page) return;
+
+    const card = document.querySelector(`.mm-memory-card[data-id="${id}"]`);
+    if (!card || card.dataset.editing === '1') return;
+    card.dataset.editing = '1';
+
+    const bodyEl = card.querySelector('.mm-memory-card-body');
+    const actionsEl = card.querySelector('.mm-memory-card-actions');
+    if (!bodyEl || !actionsEl) return;
+
+    // Replace body with textarea
+    bodyEl.style.display = 'none';
+    const textarea = document.createElement('textarea');
+    textarea.className = 'mm-edit-area';
+    textarea.style.minHeight = '100px';
+    textarea.value = page.content;
+    bodyEl.parentNode.insertBefore(textarea, bodyEl.nextSibling);
+
+    // Replace action buttons
+    const origActions = actionsEl.innerHTML;
+    actionsEl.innerHTML = `
+        <button class="mm-btn-save" style="color:#22c55e">保存</button>
+        <button class="mm-btn-cancel-edit">取消</button>
+    `;
+
+    const cleanup = () => {
+        textarea.remove();
+        bodyEl.style.display = '';
+        delete card.dataset.editing;
+        actionsEl.innerHTML = origActions;
+        // Re-bind original buttons
+        actionsEl.querySelector('.mm-btn-edit')?.addEventListener('click', () => onEditPage(id));
+        actionsEl.querySelector('.mm-btn-delete')?.addEventListener('click', () => onDeletePage(id));
+    };
+
+    actionsEl.querySelector('.mm-btn-save').addEventListener('click', () => {
+        page.content = textarea.value;
+        saveMemoryData();
+        cleanup();
+        bodyEl.textContent = page.content;
+    });
+
+    actionsEl.querySelector('.mm-btn-cancel-edit').addEventListener('click', cleanup);
+    textarea.focus();
+}
+
+// ── Known Character Attitude edit/delete/add ──
+
+function openEditKnownChar(index) {
+    const data = getMemoryData();
+    const c = data.knownCharacterAttitudes[index];
+    if (!c) return;
+    const card = document.querySelector(`.mm-entry-card[data-type="known"][data-index="${index}"]`);
+    if (!card) return;
+    const panel = card.querySelector('.mm-entry-edit-panel');
+    if (panel.style.display !== 'none') return; // already open
+    panel.style.display = '';
+    card.querySelector('.mm-entry-header').style.display = 'none';
+    panel.innerHTML =
+        `<div class="mm-edit-field"><label>角色名</label><input class="text_pole mm-ef-name" value="${escapeHtml(c.name)}" /></div>` +
+        `<div class="mm-edit-field"><label>态度</label><input class="text_pole mm-ef-attitude" value="${escapeHtml(c.attitude || '')}" /></div>` +
+        `<div class="mm-edit-btns"><button class="mm-btn-save-entry">保存</button><button class="mm-btn-cancel-entry">取消</button></div>`;
+    panel.querySelector('.mm-btn-save-entry').addEventListener('click', () => {
+        c.name = panel.querySelector('.mm-ef-name').value.trim() || c.name;
+        c.attitude = panel.querySelector('.mm-ef-attitude').value.trim();
+        saveMemoryData();
+        updateBrowserUI();
+    });
+    panel.querySelector('.mm-btn-cancel-entry').addEventListener('click', () => updateBrowserUI());
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function onDeleteKnownChar(index) {
+    const data = getMemoryData();
+    const c = data.knownCharacterAttitudes[index];
+    if (!c) return;
+    if (!confirm(`删除已知角色「${c.name}」？`)) return;
+    data.knownCharacterAttitudes.splice(index, 1);
+    saveMemoryData();
+    updateBrowserUI();
+}
+
+function onAddKnownChar() {
+    const data = getMemoryData();
+    data.knownCharacterAttitudes.push({ name: '新角色', attitude: '' });
+    saveMemoryData();
+    updateBrowserUI();
+    // Auto-open edit for the new entry
+    const newIndex = data.knownCharacterAttitudes.length - 1;
+    setTimeout(() => openEditKnownChar(newIndex), 50);
+}
+
+// ── NPC Character Dossier edit/delete/add ──
+
+function openEditNpcChar(index) {
+    const data = getMemoryData();
+    const c = data.characters[index];
+    if (!c) return;
+    const card = document.querySelector(`.mm-entry-card[data-type="npc"][data-index="${index}"]`);
+    if (!card) return;
+    const panel = card.querySelector('.mm-entry-edit-panel');
+    if (panel.style.display !== 'none') return;
+    panel.style.display = '';
+    card.querySelector('.mm-entry-header').style.display = 'none';
+    panel.innerHTML =
+        `<div class="mm-edit-field"><label>角色名</label><input class="text_pole mm-ef-name" value="${escapeHtml(c.name)}" /></div>` +
+        `<div class="mm-edit-field"><label>外貌</label><textarea class="text_pole mm-ef-appearance" rows="2">${escapeHtml(c.appearance || '')}</textarea></div>` +
+        `<div class="mm-edit-field"><label>性格</label><textarea class="text_pole mm-ef-personality" rows="2">${escapeHtml(c.personality || '')}</textarea></div>` +
+        `<div class="mm-edit-field"><label>对{{user}}的态度</label><input class="text_pole mm-ef-attitude" value="${escapeHtml(c.attitude || '')}" /></div>` +
+        `<div class="mm-edit-btns"><button class="mm-btn-save-entry">保存</button><button class="mm-btn-cancel-entry">取消</button></div>`;
+    panel.querySelector('.mm-btn-save-entry').addEventListener('click', () => {
+        c.name = panel.querySelector('.mm-ef-name').value.trim() || c.name;
+        c.appearance = panel.querySelector('.mm-ef-appearance').value.trim();
+        c.personality = panel.querySelector('.mm-ef-personality').value.trim();
+        c.attitude = panel.querySelector('.mm-ef-attitude').value.trim();
+        saveMemoryData();
+        updateBrowserUI();
+    });
+    panel.querySelector('.mm-btn-cancel-entry').addEventListener('click', () => updateBrowserUI());
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function onDeleteNpcChar(index) {
+    const data = getMemoryData();
+    const c = data.characters[index];
+    if (!c) return;
+    if (!confirm(`删除NPC「${c.name}」的档案？`)) return;
+    data.characters.splice(index, 1);
+    saveMemoryData();
+    updateBrowserUI();
+}
+
+function onAddNpcChar() {
+    const data = getMemoryData();
+    data.characters.push({ name: '新NPC', appearance: '', personality: '', attitude: '' });
+    saveMemoryData();
+    updateBrowserUI();
+    const newIndex = data.characters.length - 1;
+    setTimeout(() => openEditNpcChar(newIndex), 50);
+}
+
+// ── Item edit/delete/add ──
+
+function openEditItem(index) {
+    const data = getMemoryData();
+    const item = data.items[index];
+    if (!item) return;
+    const card = document.querySelector(`.mm-entry-card[data-type="item"][data-index="${index}"]`);
+    if (!card) return;
+    const panel = card.querySelector('.mm-entry-edit-panel');
+    if (panel.style.display !== 'none') return;
+    panel.style.display = '';
+    card.querySelector('.mm-entry-header').style.display = 'none';
+    panel.innerHTML =
+        `<div class="mm-edit-field"><label>物品名</label><input class="text_pole mm-ef-name" value="${escapeHtml(item.name)}" /></div>` +
+        `<div class="mm-edit-field"><label>状态</label><input class="text_pole mm-ef-status" value="${escapeHtml(item.status || '')}" /></div>` +
+        `<div class="mm-edit-field"><label>重要性</label>` +
+            `<select class="text_pole mm-ef-significance">` +
+                `<option value="high" ${item.significance === 'high' ? 'selected' : ''}>high</option>` +
+                `<option value="medium" ${item.significance !== 'high' ? 'selected' : ''}>medium</option>` +
+            `</select></div>` +
+        `<div class="mm-edit-btns"><button class="mm-btn-save-entry">保存</button><button class="mm-btn-cancel-entry">取消</button></div>`;
+    panel.querySelector('.mm-btn-save-entry').addEventListener('click', () => {
+        item.name = panel.querySelector('.mm-ef-name').value.trim() || item.name;
+        item.status = panel.querySelector('.mm-ef-status').value.trim();
+        item.significance = panel.querySelector('.mm-ef-significance').value;
+        saveMemoryData();
+        updateBrowserUI();
+    });
+    panel.querySelector('.mm-btn-cancel-entry').addEventListener('click', () => updateBrowserUI());
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function onDeleteItem(index) {
+    const data = getMemoryData();
+    const item = data.items[index];
+    if (!item) return;
+    if (!confirm(`删除物品「${item.name}」？`)) return;
+    data.items.splice(index, 1);
+    saveMemoryData();
+    updateBrowserUI();
+}
+
+function onAddItem() {
+    const data = getMemoryData();
+    data.items.push({ name: '新物品', status: '', significance: 'medium' });
+    saveMemoryData();
+    updateBrowserUI();
+    const newIndex = data.items.length - 1;
+    setTimeout(() => openEditItem(newIndex), 50);
+}
+
+async function onEditTimelineClick() {
+    const previewEl = document.getElementById('mm_bible_timeline');
+    const btnRow = document.getElementById('mm_timeline_btn_row');
+    if (!previewEl || !btnRow) return;
+
+    // Already in edit mode?
+    if (previewEl.dataset.editing === '1') return;
+    previewEl.dataset.editing = '1';
+
+    const data = getMemoryData();
+    const current = data.timeline || '';
+
+    // Replace preview with textarea
+    previewEl.style.display = 'none';
+    const textarea = document.createElement('textarea');
+    textarea.className = 'mm-edit-area';
+    textarea.style.minHeight = '160px';
+    textarea.value = current;
+    previewEl.parentNode.insertBefore(textarea, previewEl.nextSibling);
+
+    // Replace button row
+    btnRow.innerHTML = `
+        <button id="mm_save_timeline" style="color:#22c55e">保存</button>
+        <button id="mm_cancel_timeline">取消</button>
+    `;
+
+    const cleanup = () => {
+        textarea.remove();
+        previewEl.style.display = '';
+        delete previewEl.dataset.editing;
+        btnRow.innerHTML = '<button id="mm_edit_timeline">编辑时间线</button>';
+        document.getElementById('mm_edit_timeline')?.addEventListener('click', onEditTimelineClick);
+    };
+
+    document.getElementById('mm_save_timeline').addEventListener('click', () => {
+        data.timeline = textarea.value;
+        saveMemoryData();
+        cleanup();
+        updateBrowserUI();
+    });
+
+    document.getElementById('mm_cancel_timeline').addEventListener('click', cleanup);
+    textarea.focus();
+}
+
+async function onResetClick() {
+    const confirmed = confirm('确认重置当前聊天的所有记忆数据？此操作不可撤销。');
+    if (!confirmed) return;
+
+    const ctx = getContext();
+    ctx.chatMetadata.memoryManager = createDefaultData();
+    saveMemoryData();
+
+    setExtensionPrompt(PROMPT_KEY_INDEX, '', extension_prompt_types.IN_CHAT, 0);
+    setExtensionPrompt(PROMPT_KEY_PAGES, '', extension_prompt_types.IN_CHAT, 0);
+
+    updateBrowserUI();
+    toastr?.success?.('记忆数据已重置', 'Memory Manager');
+}
+
+function onExportClick() {
+    const data = getMemoryData();
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `memory-manager-export-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+}
+
+function onImportClick() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    input.addEventListener('change', async (e) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+        try {
+            const text = await file.text();
+            let imported = JSON.parse(text);
+            // Accept v1, v2, v3 and v4 formats
+            if (!imported.pages && !imported.storyBible && !imported.memories) {
+                throw new Error('Invalid format');
+            }
+            const ctx = getContext();
+            // Migrate through version chain
+            if (imported.storyBible || imported.version === 1) {
+                imported = migrateV1toV2(imported);
+            }
+            if (imported.version === 2) {
+                imported = migrateV2toV3(imported);
+            }
+            if (imported.version === 3) {
+                imported = migrateV3toV4(imported);
+            }
+            ctx.chatMetadata.memoryManager = imported;
+            saveMemoryData();
+            updateBrowserUI();
+            toastr?.success?.('记忆数据已导入', 'Memory Manager');
+
+            // Rebuild embeddings if configured
+            const s = getSettings();
+            if (s.useEmbedding && isEmbeddingConfigured() && imported.pages.length > 0) {
+                try {
+                    toastr?.info?.('正在为导入数据生成向量...', 'Memory Manager');
+                    await embedAllPages(imported.pages);
+                    saveMemoryData();
+                    toastr?.success?.(`已为 ${imported.pages.length} 个页面生成向量`, 'Memory Manager');
+                } catch (embErr) {
+                    warn('Post-import embedding failed:', embErr);
+                }
+            }
+        } catch (err) {
+            toastr?.error?.('导入失败: ' + err.message, 'Memory Manager');
+        }
+    });
+    input.click();
+}
+
+// ============================================================
+//  Event Handlers
+// ============================================================
+
+async function onChatEvent(messageId) {
+    if (!getSettings().enabled) return;
+    setTimeout(() => safeExtract(false), 500);
+}
+
+function onChatChanged() {
+    setExtensionPrompt(PROMPT_KEY_INDEX, '', extension_prompt_types.IN_CHAT, 0);
+    setExtensionPrompt(PROMPT_KEY_PAGES, '', extension_prompt_types.IN_CHAT, 0);
+    lastNarrative = '';
+    lastRecalledPages = [];
+    lastRecalledChars = [];
+    consecutiveFailures = 0;
+
+    const data = getMemoryData();
+    data.processing.extractionInProgress = false;
+
+    // Cross-chat save loading: if new chat has no memory but character has a save
+    const charName = getCurrentCharName();
+    if (charName && (!data.timeline && data.pages.length === 0)) {
+        const activeSlot = getActiveSlotName(charName);
+        if (activeSlot) {
+            toastr?.info?.(
+                `检测到角色「${charName}」的记忆存档「${activeSlot}」，点击此处加载`,
+                'Memory Manager',
+                {
+                    timeOut: 10000,
+                    onclick: () => loadFromSlot(charName, activeSlot),
+                },
+            );
+        }
+    }
+
+    // Re-inject story index for new chat
+    if (data.timeline || data.characters.length > 0) {
+        const s = getSettings();
+        setExtensionPrompt(
+            PROMPT_KEY_INDEX,
+            formatStoryIndex(data),
+            extension_prompt_types.IN_CHAT,
+            s.indexDepth,
+            false,
+            extension_prompt_roles.SYSTEM,
+        );
+    }
+
+    updateBrowserUI();
+    hideProcessedMessages();
+}
+
+function onMessageRendered(messageId) {
+    if (lastRecalledPages.length > 0) {
+        const data = getMemoryData();
+        if (!data.messageRecalls[messageId]) {
+            data.messageRecalls[messageId] = lastRecalledPages.map(p => p.id);
+            saveMemoryData();
+        }
+    }
+}
+
+// ============================================================
+//  Slash Commands
+// ============================================================
+
+function registerSlashCommands() {
+    const ctx = getContext();
+    if (!ctx.SlashCommandParser || !ctx.SlashCommand) {
+        log('SlashCommandParser not available, skipping command registration');
+        return;
+    }
+
+    const { SlashCommandParser, SlashCommand } = ctx;
+
+    try {
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-extract',
+            callback: async () => {
+                await safeExtract(true);
+                return '记忆提取完成';
+            },
+            helpString: '强制执行记忆提取',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-recall',
+            callback: async () => {
+                if (!lastNarrative) return '当前没有记忆召回';
+                const sources = lastRecalledPages.map(p => `${p.day} ${p.title}`).join(', ');
+                return lastNarrative + (sources ? `\n\n来源: ${sources}` : '');
+            },
+            helpString: '显示当前记忆召回叙事',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-index',
+            callback: async () => {
+                const data = getMemoryData();
+                return formatStoryIndex(data) || '（故事索引为空）';
+            },
+            helpString: '显示当前故事索引',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-pages',
+            callback: async () => {
+                const data = getMemoryData();
+                if (data.pages.length === 0) return '没有故事页';
+                return data.pages.map(p => {
+                    const level = ['详细', '摘要', '归档'][p.compressionLevel] || '?';
+                    return `[${p.day}] ${p.title} (${p.significance}, ${level}) keywords: ${(p.keywords || []).join(',')}`;
+                }).join('\n');
+            },
+            helpString: '列出所有故事页',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-compress',
+            callback: async () => {
+                await safeCompress(true);
+                return '压缩完成';
+            },
+            helpString: '强制执行记忆压缩',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-reset',
+            callback: async () => {
+                onResetClick();
+                return '';
+            },
+            helpString: '重置当前聊天的记忆数据',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'mm-gen-auth',
+            callback: async (_args, value) => {
+                const code = value?.trim();
+                if (!code) return '用法: /mm-gen-auth <授权码明文>';
+                const hash = await sha256(code);
+                return `授权码: ${code}\nSHA-256: '${hash}',`;
+            },
+            helpString: '生成授权码的 SHA-256 哈希（作者用）',
+        }));
+
+        log('Slash commands registered');
+    } catch (err) {
+        warn('Failed to register slash commands:', err);
+    }
+}
+
+// ============================================================
+//  Initialization
+// ============================================================
+
+function fullInitialize() {
     bindSettingsPanel();
-  } catch (e) { error('settings.html 加载失败', e); }
+    bindRecallFab();
 
-  getWiModule();
+    // Register events
+    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
+    eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, onChatEvent);
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageRendered);
+    for (const evt of [event_types.MESSAGE_DELETED, event_types.MESSAGE_UPDATED, event_types.MESSAGE_SWIPED]) {
+        eventSource.on(evt, onChatEvent);
+    }
 
-  const wrap = document.createElement('div');
-  wrap.id = 'mem-manager-root';
-  wrap.innerHTML = buildFabHTML() + buildPanelsHTML();
-  document.body.appendChild(wrap);
+    registerSlashCommands();
+    updateBrowserUI();
 
-  const fabRoot = document.getElementById('mem-fab-root');
-  if (!settings.enabled) { fabRoot.classList.add('mem-hidden'); updateSettingsStatus('⏸ 已禁用'); }
-  else updateSettingsStatus('✅ 运行中');
+    log('Memory Manager v5.0 (PageIndex+Embedding+Agent) initialized');
+}
 
-  const dragDock = new DragDock(fabRoot, () => {
-    if (uiState.processing) return;
-    if (getSettings().isDocked) { dragDock.undock(); return; }
-    uiState.menuOpen = !uiState.menuOpen;
-    fabRoot.classList.toggle('mem-active', uiState.menuOpen);
-    const ov = document.getElementById('memFabOverlay');
-    if (ov) ov.classList.toggle('mem-visible', uiState.menuOpen);
-  });
-  dragDock.restorePosition();
-  bindEvents(fabRoot, dragDock);
+jQuery(async function () {
+    try {
+        const baseUrl = new URL('.', import.meta.url).pathname;
+        const settingsHtml = await $.get(`${baseUrl}settings.html`);
+        $('#extensions_settings2').append(settingsHtml);
+    } catch (err) {
+        warn('Failed to load settings HTML:', err);
+    }
 
-  window.addEventListener('resize', () => {
-    if (fabRoot.classList.contains('mem-docked-right'))
-      dragDock.setPosition(window.innerWidth - 80, dragDock.posY);
-  });
+    loadSettings();
 
-  window._memoryManager = manager;
-  window._floorManager = floorMgr;
-  console.log('[回忆管理器] ✅ v2.9.0 就绪');
+    // === AUTH GATE ===
+    if (!isAuthorized()) {
+        showAuthScreen();
+        bindAuthUI();
+        return;  // Don't register events, don't bind settings, don't init
+    }
+
+    hideAuthScreen();
+    fullInitialize();
 });
+
+export { MODULE_NAME };

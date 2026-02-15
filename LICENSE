@@ -1,0 +1,141 @@
+MMPEA 记忆管理 专有软件许可协议
+MMPEA Memory Manager Proprietary Software License Agreement
+
+版本 1.0 | Version 1.0
+生效日期：2026年2月15日 | Effective Date: February 15, 2026
+
+================================================================================
+
+版权所有 (C) 2026 金瓜瓜 (@gua.guagua.uk)
+Copyright (C) 2026 金瓜瓜 (@gua.guagua.uk)
+
+保留所有权利。All Rights Reserved.
+
+================================================================================
+
+第一条 定义
+
+1.1 "本软件"指 MMPEA 记忆管理（Memory Manager）的全部源代码、目标代码、
+    文档、配置文件、用户界面、样式文件、提示词模板及其所有组成部分。
+1.2 "作者"指唯一版权持有人 金瓜瓜（@gua.guagua.uk）。
+
+第二条 权利声明
+
+2.1 作者是本软件的唯一权利人，保留全部知识产权，包括但不限于著作权、
+    商标权、商业秘密及其他一切相关权利。
+2.2 作者有权以任何方式使用、修改、分发、商用本软件，不受任何限制。
+2.3 本软件不授予任何第三方任何形式的使用、复制、修改、分发或其他权利。
+2.4 本软件不是开源软件。源代码的可见性不构成任何形式的许可授予。
+
+第三条 禁止行为
+
+未经作者明确书面授权，任何个人或组织不得：
+
+3.1 使用、安装或运行本软件；
+3.2 复制、分发、传播、转载、公开发布本软件的源代码、文档或任何组成部分；
+3.3 对本软件进行反向工程、反编译、反汇编或其他任何形式的逆向分析；
+3.4 修改、改编本软件或基于本软件创建衍生作品；
+3.5 移除、篡改或遮蔽本软件中的任何版权声明、许可信息或保护机制；
+3.6 将本软件用于任何商业或非商业用途；
+3.7 将本软件的全部或部分整合、嵌入到其他软件、服务或产品中；
+3.8 以本软件为基础进行教学、培训、演示或任何形式的公开展示；
+3.9 对本软件的架构、算法、提示词工程或设计思路进行抄袭或模仿。
+
+第四条 法律责任
+
+4.1 未授权使用：任何未经授权使用、复制、分发、修改本软件的行为均构成
+    对作者知识产权的侵犯，作者保留追究全部法律责任的权利。
+4.2 损害赔偿：侵权方应赔偿作者因此遭受的一切损失，包括但不限于直接
+    损失、间接损失、维权费用及合理的律师费。
+4.3 适用法律：本协议受中华人民共和国法律管辖并依其解释。因本协议引起
+    的争议应提交作者所在地有管辖权的人民法院裁决。
+
+第五条 免责声明
+
+5.1 本软件按"原样"提供，不作任何明示或暗示的担保，包括但不限于对适销
+    性、特定用途适用性和非侵权性的担保。
+5.2 在任何情况下，作者不对因使用或无法使用本软件而产生的任何直接、间接、
+    附带、特殊或后果性损害承担责任。
+
+第六条 其他
+
+6.1 本协议构成关于本软件权利归属和使用限制的完整声明。
+6.2 本协议任何条款被认定为无效或不可执行的，不影响其余条款的效力。
+6.3 作者保留随时修改本协议的权利，修改后的协议将在发布时生效。
+
+================================================================================
+
+Article 1 Definitions
+
+1.1 "Software" refers to all source code, object code, documentation,
+    configuration files, user interfaces, stylesheets, prompt templates,
+    and all components of MMPEA Memory Manager.
+1.2 "Author" refers to the sole copyright holder 金瓜瓜 (@gua.guagua.uk).
+
+Article 2 Rights Declaration
+
+2.1 The Author is the sole rights holder of the Software and retains all
+    intellectual property rights, including but not limited to copyrights,
+    trademark rights, trade secrets, and all other related rights.
+2.2 The Author may use, modify, distribute, and commercialize the Software
+    in any manner without restriction.
+2.3 This Software does not grant any third party any rights of any kind,
+    including but not limited to rights to use, copy, modify, or distribute.
+2.4 This Software is not open source. The visibility of source code does
+    not constitute any form of license grant.
+
+Article 3 Prohibited Activities
+
+Without the Author's explicit written authorization, no individual or
+organization shall:
+
+3.1 Use, install, or run the Software;
+3.2 Copy, distribute, disseminate, repost, or publicly release the source
+    code, documentation, or any component of the Software;
+3.3 Reverse engineer, decompile, disassemble, or otherwise attempt to
+    derive the source code of the Software;
+3.4 Modify, adapt, or create derivative works based on the Software;
+3.5 Remove, alter, or obscure any copyright notices, license information,
+    or protection mechanisms in the Software;
+3.6 Use the Software for any commercial or non-commercial purpose;
+3.7 Integrate or embed the Software, in whole or in part, into other
+    software, services, or products;
+3.8 Use the Software as a basis for teaching, training, demonstration,
+    or any form of public presentation;
+3.9 Plagiarize or imitate the architecture, algorithms, prompt engineering,
+    or design concepts of the Software.
+
+Article 4 Legal Liability
+
+4.1 Unauthorized Use: Any unauthorized use, copying, distribution, or
+    modification of the Software constitutes infringement of the Author's
+    intellectual property rights. The Author reserves the right to pursue
+    all available legal remedies.
+4.2 Damages: The infringing party shall compensate the Author for all
+    losses incurred, including but not limited to direct losses, indirect
+    losses, enforcement costs, and reasonable attorney fees.
+4.3 Governing Law: This Agreement is governed by and construed in
+    accordance with the laws of the People's Republic of China. Disputes
+    shall be submitted to the competent People's Court at the Author's
+    place of domicile.
+
+Article 5 Disclaimer
+
+5.1 THE SOFTWARE IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+5.2 IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES ARISING FROM THE USE OR
+    INABILITY TO USE THE SOFTWARE.
+
+Article 6 Miscellaneous
+
+6.1 This Agreement constitutes the complete declaration regarding the
+    ownership and usage restrictions of the Software.
+6.2 If any provision is found invalid or unenforceable, the remaining
+    provisions shall remain in full force and effect.
+6.3 The Author reserves the right to modify this Agreement at any time.
+    Modified terms take effect upon publication.
+
+================================================================================
+联系方式 | Contact: 金瓜瓜 @gua.guagua.uk
