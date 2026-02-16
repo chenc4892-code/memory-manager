@@ -3573,7 +3573,12 @@ async function performBatchInitialization() {
         data.processing.extractionInProgress = false;
         saveMemoryData();
         updateBrowserUI();
-        if (failedBatches.length === 0) hideInitProgressUI();
+        if (failedBatches.length > 0) {
+            // Re-render now that initializationInProgress is false so the retry button appears
+            updateInitProgressUI(totalBatches, totalBatches, `完成！${failedBatches.length} 个批次失败，可点击重试`);
+        } else {
+            hideInitProgressUI();
+        }
     }
 }
 
@@ -3658,6 +3663,10 @@ async function retryFailedBatches() {
         data.processing.extractionInProgress = false;
         saveMemoryData();
         updateBrowserUI();
+        if (failedBatches.length > 0) {
+            // Re-render so the retry button appears now that initializationInProgress is false
+            updateInitProgressUI(totalRetry, totalRetry, `重试完成，仍有 ${failedBatches.length} 批失败`);
+        }
     }
 }
 
