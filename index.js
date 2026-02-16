@@ -1767,6 +1767,7 @@ function buildExtractionPrompt(data, newMessages) {
 每个页面包含:
 - title: 短标题（4-8字）
 - day: 对应时间线中的D几
+- date: 剧情中的具体日期，格式 YYMMDD（如 "251017"）。从消息中的状态栏/时间描述提取，无法确定则留空字符串
 - content: 以事件为单位，记录因果链（50-150字）。规则：
   · 写"为什么"而非仅写"做了什么"（因果关系优先）
     ❌ "她典当了项链，去买了衣服"
@@ -1826,6 +1827,7 @@ ${newMessages}
     {
       "title": "...",
       "day": "D1",
+      "date": "251017",
       "content": "...",
       "keywords": ["...", "..."],
       "categories": ["emotional", "relationship"],
@@ -1842,6 +1844,7 @@ ${newMessages}
 - newCharacters 不含主角"${userName}"和已知角色
 - items要输出完整列表（含未变化的旧条目）
 - newPages仅包含本批消息中提取的新页面
+- date格式为YYMMDD（如 "251017" 表示2025年10月17日），从消息中的状态栏/时间信息提取，不确定则留空
 - categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
 - 时间线每行不超过30字，像目录一样简洁
 ]`;
@@ -1892,7 +1895,7 @@ function buildInitExtractionPrompt(data, messages) {
 每个物品: name, status, significance
 
 ### 4. 提取故事页（重要！）
-这是初始化流程。为本批内容中所有值得记录的事件创建故事页。
+这是初始化流程。从故事开始的第一天起，为本批内容中所有值得记录的事件创建故事页。
 即使这些事件已经反映在时间线中，仍然需要创建对应的故事页。
 任何改变事件走向、揭示关键信息、推动关系变化的事件都应有一页。
 日常噪音（补妆、移动、整理仪容等不影响剧情的动作）不记录。
@@ -1900,6 +1903,7 @@ function buildInitExtractionPrompt(data, messages) {
 每页包含:
 - title: 短标题（4-8字）
 - day: 对应时间线中的D几
+- date: 剧情中的具体日期，格式 YYMMDD（如 "251017"）。从消息中的状态栏/时间描述提取，无法确定则留空字符串
 - content: 以事件为单位，记录因果链（50-150字）。规则：
   · 写"为什么"而非仅写"做了什么"（因果关系优先）
     ❌ "她典当了项链，去买了衣服"
@@ -1925,6 +1929,7 @@ function buildInitExtractionPrompt(data, messages) {
 - newCharacters 不含主角"${userName}"和已知角色
 - items要输出完整列表
 - newPages要为每个值得记录的事件都创建，不要遗漏
+- date格式为YYMMDD（如 "251017" 表示2025年10月17日），从消息中的状态栏/时间信息提取，不确定则留空
 - categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
 - 时间线每行不超过30字，像目录一样简洁
 
@@ -1967,6 +1972,7 @@ ${messages}
     {
       "title": "...",
       "day": "D1",
+      "date": "251017",
       "content": "...",
       "keywords": ["...", "..."],
       "categories": ["emotional", "relationship"],
@@ -2009,19 +2015,29 @@ function applyExtractionResult(data, result) {
         }
     }
 
-    // Update new NPC characters (new format)
+    // Update new NPC characters (new format) — merge, not replace
     if (Array.isArray(result.newCharacters) && result.newCharacters.length > 0) {
-        data.characters = result.newCharacters
-            .filter(c => c.name
-                && c.name.trim().toLowerCase() !== userName
-                && !knownLower.has(c.name.trim().toLowerCase()),
-            )
-            .map(c => ({
-                name: c.name || '',
+        for (const c of result.newCharacters) {
+            if (!c.name || c.name.trim().toLowerCase() === userName) continue;
+            if (knownLower.has(c.name.trim().toLowerCase())) continue;
+            const existingIdx = data.characters.findIndex(
+                ch => ch.name.toLowerCase() === c.name.trim().toLowerCase(),
+            );
+            const charData = {
+                name: c.name.trim(),
                 appearance: c.appearance || '',
                 personality: c.personality || '',
                 attitude: c.attitude || '',
-            }));
+            };
+            if (existingIdx >= 0) {
+                // Merge: only overwrite non-empty fields
+                if (charData.appearance) data.characters[existingIdx].appearance = charData.appearance;
+                if (charData.personality) data.characters[existingIdx].personality = charData.personality;
+                if (charData.attitude) data.characters[existingIdx].attitude = charData.attitude;
+            } else {
+                data.characters.push(charData);
+            }
+        }
     }
 
     // Backward compatibility: if LLM returns old "characters" array instead of split format
@@ -2063,13 +2079,25 @@ function applyExtractionResult(data, result) {
         }
     }
 
-    // Update items
+    // Update items — merge, not replace
     if (Array.isArray(result.items)) {
-        data.items = result.items.map(item => ({
-            name: item.name || '',
-            status: item.status || '',
-            significance: item.significance || '',
-        }));
+        for (const item of result.items) {
+            if (!item.name) continue;
+            const existingIdx = data.items.findIndex(
+                it => it.name.toLowerCase() === item.name.trim().toLowerCase(),
+            );
+            const itemData = {
+                name: item.name.trim(),
+                status: item.status || '',
+                significance: item.significance || '',
+            };
+            if (existingIdx >= 0) {
+                if (itemData.status) data.items[existingIdx].status = itemData.status;
+                if (itemData.significance) data.items[existingIdx].significance = itemData.significance;
+            } else {
+                data.items.push(itemData);
+            }
+        }
     }
 
     // Add new pages
@@ -2092,6 +2120,7 @@ function applyExtractionResult(data, result) {
             data.pages.push({
                 id: newId,
                 day: page.day || '',
+                date: page.date || '',
                 title: page.title,
                 content: page.content,
                 keywords: keywords,
@@ -2118,33 +2147,88 @@ async function performExtraction() {
     const chat = ctx.chat;
     if (startIdx >= chat.length) return;
 
-    const newMsgs = chat.slice(startIdx)
-        .filter(m => !m.is_system)
-        .map(m => `${m.name}: ${m.mes}`)
-        .join('\n\n');
-
-    if (!newMsgs.trim()) return;
-
-    log('Extracting from messages', startIdx, 'to', chat.length - 1);
-
-    const prompt = buildExtractionPrompt(data, newMsgs);
-    const response = await callLLM(
-        '你是剧情记忆管理系统。严格按要求输出JSON。',
-        prompt,
-        getSettings().extractionMaxTokens,
-    );
-
-    log('Extraction response length:', response?.length);
-
-    const result = parseJsonResponse(response);
-    if (!result) {
-        throw new Error('Failed to parse extraction response');
+    // Buffer zone: skip recent N-2 messages to avoid extracting content user might re-roll
+    const s = getSettings();
+    let endIdx = chat.length; // exclusive
+    if (s.autoHide && s.keepRecentMessages >= 3) {
+        const buffer = Math.max(0, s.keepRecentMessages - 2);
+        endIdx = Math.max(startIdx, chat.length - buffer);
     }
+    if (startIdx >= endIdx) return;
 
-    applyExtractionResult(data, result);
+    const pendingMsgs = chat.slice(startIdx, endIdx).filter(m => !m.is_system && m.mes);
+    if (pendingMsgs.length === 0) return;
 
-    data.processing.lastExtractedMessageId = chat.length - 1;
-    saveMemoryData();
+    const BATCH_THRESHOLD = 25;
+    const BATCH_SIZE = 20;
+
+    if (pendingMsgs.length <= BATCH_THRESHOLD) {
+        // Single-batch extraction (original behavior)
+        const newMsgs = pendingMsgs.map(m => `${m.name}: ${m.mes}`).join('\n\n');
+        log('Extracting from messages', startIdx, 'to', endIdx - 1, `(buffer: skipping last ${chat.length - endIdx} msgs)`);
+
+        const prompt = buildExtractionPrompt(data, newMsgs);
+        const response = await callLLM(
+            '你是剧情记忆管理系统。严格按要求输出JSON。',
+            prompt,
+            s.extractionMaxTokens,
+        );
+
+        log('Extraction response length:', response?.length);
+
+        const result = parseJsonResponse(response);
+        if (!result) {
+            throw new Error('Failed to parse extraction response');
+        }
+
+        applyExtractionResult(data, result);
+        data.processing.lastExtractedMessageId = endIdx - 1;
+        saveMemoryData();
+    } else {
+        // Multi-batch extraction for large backlogs
+        const msgWithIdx = [];
+        for (let i = startIdx; i < endIdx; i++) {
+            const m = chat[i];
+            if (!m.is_system && m.mes) {
+                msgWithIdx.push({ msg: m, idx: i });
+            }
+        }
+
+        const batches = [];
+        for (let i = 0; i < msgWithIdx.length; i += BATCH_SIZE) {
+            batches.push(msgWithIdx.slice(i, i + BATCH_SIZE));
+        }
+
+        log(`Batched extraction: ${msgWithIdx.length} messages → ${batches.length} batches`);
+        const initMaxTokens = Math.max(s.extractionMaxTokens, 8192);
+
+        for (let bi = 0; bi < batches.length; bi++) {
+            const batch = batches[bi];
+            const batchText = batch.map(item => `${item.msg.name}: ${item.msg.mes}`).join('\n\n');
+            const batchLastIdx = batch[batch.length - 1].idx;
+
+            log(`Batch ${bi + 1}/${batches.length}: messages ${batch[0].idx}-${batchLastIdx}`);
+            toastr?.info?.(`正在提取第 ${bi + 1}/${batches.length} 批...`, 'Memory Manager', { timeOut: 3000 });
+
+            const prompt = buildExtractionPrompt(data, batchText);
+            const response = await callLLM(
+                '你是剧情记忆管理系统。严格按要求输出JSON。',
+                prompt,
+                initMaxTokens,
+            );
+
+            const result = parseJsonResponse(response);
+            if (!result) {
+                warn(`Batch ${bi + 1}: Failed to parse response, skipping`);
+                continue;
+            }
+
+            applyExtractionResult(data, result);
+            data.processing.lastExtractedMessageId = batchLastIdx;
+            saveMemoryData();
+            log(`Batch ${bi + 1}/${batches.length} done. Pages: ${data.pages.length}`);
+        }
+    }
 
     log('Extraction complete. Pages:', data.pages.length, 'Timeline updated.');
 
@@ -2684,6 +2768,7 @@ function buildAgentPrompt(data, recentText, candidatePages, maxPages) {
 [记忆闪回]
 
 （不多于500字的连贯叙事）
+- 时间线中的D1，在写叙事时，不要写成D1，写成第一天/初识时等等，以此类推
 - 写清事件之间的因果和情感脉络
 - 保留对当前对话重要的具体细节
 - 聚焦当前需要，不面面俱到
@@ -3077,6 +3162,16 @@ function bindRecallFab() {
     // 动态创建悬浮球和面板，直接挂到 body 上
     if (document.getElementById('mm_recall_fab')) return;
 
+    // Helper: apply inline !important styles (highest CSS priority, immune to theme overrides)
+    function forceStyle(el, props) {
+        for (const [k, v] of Object.entries(props)) {
+            el.style.setProperty(k, v, 'important');
+        }
+    }
+
+    // Check Popover API support — puts elements in top layer, above everything including <dialog>
+    const hasPopover = typeof HTMLElement.prototype.showPopover === 'function';
+
     const fab = document.createElement('div');
     fab.id = 'mm_recall_fab';
     fab.className = 'mm-recall-fab';
@@ -3085,12 +3180,49 @@ function bindRecallFab() {
         <div id="mm_lottie_container" class="mm-lottie-container"></div>
         <span id="mm_recall_fab_count" class="mm-recall-fab-count" style="display:none">0</span>
     `;
+    forceStyle(fab, {
+        'position': 'fixed',
+        'z-index': '99990',
+        'display': 'flex',
+        'align-items': 'center',
+        'justify-content': 'center',
+        'pointer-events': 'auto',
+        'visibility': 'visible',
+        'opacity': '1',
+        'width': '64px',
+        'height': '64px',
+    });
     document.body.appendChild(fab);
 
     const panel = document.createElement('div');
     panel.id = 'mm_recall_panel';
     panel.className = 'mm-recall-panel';
-    panel.style.display = 'none';
+    // Use Popover API if available — renders in top layer, immune to all z-index/stacking issues
+    if (hasPopover) {
+        panel.setAttribute('popover', 'manual');
+    }
+    forceStyle(panel, {
+        'position': 'fixed',
+        'z-index': '99991',
+        'flex-direction': 'column',
+        'pointer-events': 'auto',
+        'visibility': 'visible',
+        'opacity': '1',
+        'width': '380px',
+        'max-width': 'calc(100vw - 16px)',
+        'max-height': '500px',
+        'border-radius': '12px',
+        'background': 'rgba(255, 255, 255, 0.92)',
+        'border': '1px solid rgba(0,0,0,0.1)',
+        'box-shadow': '0 8px 32px rgba(0,0,0,0.18)',
+        'overflow': 'hidden',
+        'backdrop-filter': 'blur(16px)',
+        '-webkit-backdrop-filter': 'blur(16px)',
+        'color': '#222',
+    });
+    if (!hasPopover) {
+        panel.style.setProperty('display', 'none', 'important');
+    }
     panel.innerHTML = `
         <div class="mm-recall-panel-header">
             <span>本次记忆召回</span>
@@ -3101,6 +3233,38 @@ function bindRecallFab() {
         </div>
     `;
     document.body.appendChild(panel);
+
+    // Panel show/hide helpers (popover + display fallback)
+    let panelOpen = false;
+    function showPanel() {
+        updateRecallPanel();
+        const rect = getFabRect();
+        const viewW = window.innerWidth;
+        const viewH = window.innerHeight;
+        if (rect.left < viewW / 2) {
+            panel.style.setProperty('left', Math.max(8, rect.left) + 'px', 'important');
+            panel.style.setProperty('right', 'auto', 'important');
+        } else {
+            panel.style.setProperty('left', 'auto', 'important');
+            panel.style.setProperty('right', Math.max(8, viewW - rect.right) + 'px', 'important');
+        }
+        const panelMaxH = 500;
+        if (rect.top >= panelMaxH || rect.top >= viewH - rect.bottom) {
+            panel.style.setProperty('bottom', (viewH - rect.top + 8) + 'px', 'important');
+            panel.style.setProperty('top', 'auto', 'important');
+        } else {
+            panel.style.setProperty('top', (rect.bottom + 8) + 'px', 'important');
+            panel.style.setProperty('bottom', 'auto', 'important');
+        }
+        if (hasPopover) { try { panel.showPopover(); } catch (_) {} }
+        panel.style.setProperty('display', 'flex', 'important');
+        panelOpen = true;
+    }
+    function hidePanel() {
+        if (hasPopover) { try { panel.hidePopover(); } catch (_) {} }
+        panel.style.setProperty('display', 'none', 'important');
+        panelOpen = false;
+    }
 
     // ── Drag & Snap logic ──
     let isDragging = false;
@@ -3205,23 +3369,10 @@ function bindRecallFab() {
     // ── Click / Tap: toggle panel (only if not dragged) ──
     fab.addEventListener('click', () => {
         if (hasMoved) return; // was a drag, not a click
-        const isOpen = panel.style.display !== 'none';
-        if (isOpen) {
-            panel.style.display = 'none';
+        if (panelOpen) {
+            hidePanel();
         } else {
-            updateRecallPanel();
-            // Position panel near the fab
-            const rect = getFabRect();
-            const viewW = window.innerWidth;
-            if (rect.left < viewW / 2) {
-                panel.style.left = rect.left + 'px';
-                panel.style.right = 'auto';
-            } else {
-                panel.style.left = 'auto';
-                panel.style.right = (viewW - rect.right) + 'px';
-            }
-            panel.style.bottom = (window.innerHeight - rect.top + 8) + 'px';
-            panel.style.display = '';
+            showPanel();
         }
     });
 
@@ -3234,7 +3385,7 @@ function bindRecallFab() {
     }, { passive: true });
 
     document.getElementById('mm_recall_panel_close')?.addEventListener('click', () => {
-        panel.style.display = 'none';
+        hidePanel();
     });
 
     // Restore saved position or default to bottom-right
@@ -3264,6 +3415,7 @@ function bindRecallFab() {
 // ============================================================
 
 let initializationInProgress = false;
+let failedBatches = []; // Store failed batches for retry
 
 async function performBatchInitialization() {
     if (initializationInProgress) {
@@ -3335,6 +3487,7 @@ async function performBatchInitialization() {
 
     const totalBatches = batches.length;
     let successBatches = 0;
+    failedBatches = []; // Reset failed batch cache
 
     toastr?.info?.(`开始初始化：${worldBookContext ? '含世界书，' : ''}共 ${allMessages.length} 条消息，分 ${totalBatches} 批处理...`, 'Memory Manager', { timeOut: 5000 });
     updateInitProgressUI(0, totalBatches, '开始处理...');
@@ -3360,6 +3513,7 @@ async function performBatchInitialization() {
                 const result = parseJsonResponse(response);
                 if (!result) {
                     warn(`Batch ${ci + 1}: Failed to parse response.`);
+                    failedBatches.push({ index: ci, batch, reason: '解析失败' });
                     continue;
                 }
 
@@ -3382,6 +3536,7 @@ async function performBatchInitialization() {
 
             } catch (err) {
                 warn(`Batch ${ci + 1} failed:`, err);
+                failedBatches.push({ index: ci, batch, reason: err.message });
                 toastr?.warning?.(`第 ${ci + 1} 批处理失败: ${err.message}`, 'Memory Manager');
             }
         }
@@ -3391,13 +3546,23 @@ async function performBatchInitialization() {
             await hideProcessedMessages();
         }
 
-        updateInitProgressUI(totalBatches, totalBatches, '初始化完成！');
-        setMood('inlove', 8000);
-        toastr?.success?.(
-            `初始化完成！处理 ${successBatches}/${totalBatches} 批，提取 ${data.pages.length} 个故事页`,
-            'Memory Manager',
-            { timeOut: 8000 },
-        );
+        if (failedBatches.length > 0) {
+            updateInitProgressUI(totalBatches, totalBatches, `完成！${failedBatches.length} 个批次失败，可点击重试`);
+            setMood('sad', 6000);
+            toastr?.warning?.(
+                `初始化完成，但有 ${failedBatches.length}/${totalBatches} 批失败。点击"重试失败批次"可重新处理。`,
+                'Memory Manager',
+                { timeOut: 10000 },
+            );
+        } else {
+            updateInitProgressUI(totalBatches, totalBatches, '初始化完成！');
+            setMood('inlove', 8000);
+            toastr?.success?.(
+                `初始化完成！处理 ${successBatches}/${totalBatches} 批，提取 ${data.pages.length} 个故事页`,
+                'Memory Manager',
+                { timeOut: 8000 },
+            );
+        }
 
     } catch (err) {
         warn('Batch initialization error:', err);
@@ -3408,7 +3573,91 @@ async function performBatchInitialization() {
         data.processing.extractionInProgress = false;
         saveMemoryData();
         updateBrowserUI();
-        hideInitProgressUI();
+        if (failedBatches.length === 0) hideInitProgressUI();
+    }
+}
+
+async function retryFailedBatches() {
+    if (initializationInProgress) {
+        toastr?.warning?.('处理中，请等待', 'Memory Manager');
+        return;
+    }
+    if (failedBatches.length === 0) {
+        toastr?.info?.('没有需要重试的批次', 'Memory Manager');
+        return;
+    }
+
+    initializationInProgress = true;
+    setMood('thinking');
+    const s = getSettings();
+    const initMaxTokens = Math.max(s.extractionMaxTokens, 8192);
+    const data = getMemoryData();
+    data.processing.extractionInProgress = true;
+    saveMemoryData();
+
+    const pending = [...failedBatches];
+    failedBatches = [];
+    const totalRetry = pending.length;
+    let retrySuccess = 0;
+
+    toastr?.info?.(`开始重试 ${totalRetry} 个失败批次...`, 'Memory Manager');
+
+    try {
+        for (let ri = 0; ri < pending.length; ri++) {
+            const { index, batch } = pending[ri];
+            updateInitProgressUI(ri, totalRetry, `重试第 ${index + 1} 批 (${batch.label})...`);
+
+            try {
+                const prompt = buildInitExtractionPrompt(data, batch.text);
+                const response = await callLLM(
+                    '你是剧情记忆管理系统。严格按要求输出JSON。',
+                    prompt,
+                    initMaxTokens,
+                );
+
+                const result = parseJsonResponse(response);
+                if (!result) {
+                    failedBatches.push({ index, batch, reason: '解析失败' });
+                    continue;
+                }
+
+                applyExtractionResult(data, result);
+
+                if (batch.type === 'chat' && batch.sourceIds.length > 0) {
+                    const newPages = data.pages.filter(p => p.sourceMessages.length === 0);
+                    for (const p of newPages) {
+                        p.sourceMessages = batch.sourceIds;
+                    }
+                    if (batch.lastIdx > data.processing.lastExtractedMessageId) {
+                        data.processing.lastExtractedMessageId = batch.lastIdx;
+                    }
+                }
+
+                saveMemoryData();
+                retrySuccess++;
+            } catch (err) {
+                warn(`Retry batch ${index + 1} failed:`, err);
+                failedBatches.push({ index, batch, reason: err.message });
+            }
+        }
+
+        if (failedBatches.length > 0) {
+            updateInitProgressUI(totalRetry, totalRetry, `重试完成，仍有 ${failedBatches.length} 批失败`);
+            toastr?.warning?.(`重试完成: ${retrySuccess} 成功, ${failedBatches.length} 仍失败`, 'Memory Manager');
+        } else {
+            updateInitProgressUI(totalRetry, totalRetry, '重试全部成功！');
+            setMood('inlove', 6000);
+            toastr?.success?.(`重试完成！全部 ${retrySuccess} 批成功`, 'Memory Manager');
+            hideInitProgressUI();
+        }
+    } catch (err) {
+        warn('Retry error:', err);
+        toastr?.error?.('重试出错: ' + err.message, 'Memory Manager');
+    } finally {
+        initializationInProgress = false;
+        data.processing.extractionInProgress = false;
+        saveMemoryData();
+        updateBrowserUI();
     }
 }
 
@@ -3417,13 +3666,21 @@ function updateInitProgressUI(current, total, text) {
     if (!container) return;
     const pct = total > 0 ? Math.round((current / total) * 100) : 0;
     container.style.display = 'block';
+    const retryBtn = failedBatches.length > 0 && !initializationInProgress
+        ? `<div class="mm-action-row" style="margin-top:6px"><button id="mm_retry_failed" style="color:#f59e0b">重试失败批次 (${failedBatches.length})</button></div>`
+        : '';
     container.innerHTML = `
         <div class="mm-init-progress-text">${escapeHtml(text)}</div>
         <div class="mm-init-progress-bar-track">
             <div class="mm-init-progress-bar-fill" style="width:${pct}%"></div>
         </div>
         <div class="mm-init-progress-pct">${pct}%</div>
+        ${retryBtn}
     `;
+    const retryEl = document.getElementById('mm_retry_failed');
+    if (retryEl) {
+        retryEl.addEventListener('click', () => retryFailedBatches());
+    }
 }
 
 function hideInitProgressUI() {
@@ -3520,11 +3777,13 @@ function updateBrowserUI() {
                 `<div class="mm-entry-card" data-type="known" data-index="${i}">` +
                     `<div class="mm-entry-header">` +
                         `<span class="mm-entry-name">${escapeHtml(c.name)}</span>` +
-                        `<span class="mm-entry-summary">${escapeHtml(c.attitude || '(未设定)')}</span>` +
                         `<span class="mm-entry-actions">` +
                             `<button class="mm-entry-btn mm-btn-edit-entry" data-index="${i}">编辑</button>` +
                             `<button class="mm-entry-btn mm-btn-del-entry" data-index="${i}">删除</button>` +
                         `</span>` +
+                    `</div>` +
+                    `<div class="mm-entry-body">` +
+                        `<div class="mm-entry-field"><span class="mm-entry-field-label">态度</span><span class="mm-entry-field-value">${escapeHtml(c.attitude || '(未设定)')}</span></div>` +
                     `</div>` +
                     `<div class="mm-entry-edit-panel" style="display:none"></div>` +
                 `</div>`
@@ -3545,16 +3804,19 @@ function updateBrowserUI() {
             charsEl.innerHTML = '<div class="mm-empty-state">暂无NPC数据</div>';
         } else {
             charsEl.innerHTML = data.characters.map((c, i) => {
-                const summary = [c.appearance, c.personality, c.attitude].filter(Boolean).join(' · ');
+                const fields = [];
+                if (c.appearance) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">外貌</span><span class="mm-entry-field-value">${escapeHtml(c.appearance)}</span></div>`);
+                if (c.personality) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">性格</span><span class="mm-entry-field-value">${escapeHtml(c.personality)}</span></div>`);
+                fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">态度</span><span class="mm-entry-field-value">${escapeHtml(c.attitude || '(未设定)')}</span></div>`);
                 return `<div class="mm-entry-card" data-type="npc" data-index="${i}">` +
                     `<div class="mm-entry-header">` +
                         `<span class="mm-entry-name">${escapeHtml(c.name)}</span>` +
-                        `<span class="mm-entry-summary">${escapeHtml(summary || '(未设定)')}</span>` +
                         `<span class="mm-entry-actions">` +
                             `<button class="mm-entry-btn mm-btn-edit-entry" data-index="${i}">编辑</button>` +
                             `<button class="mm-entry-btn mm-btn-del-entry" data-index="${i}">删除</button>` +
                         `</span>` +
                     `</div>` +
+                    `<div class="mm-entry-body">${fields.join('')}</div>` +
                     `<div class="mm-entry-edit-panel" style="display:none"></div>` +
                 `</div>`;
             }).join('');
@@ -3573,19 +3835,24 @@ function updateBrowserUI() {
         if (data.items.length === 0) {
             itemsEl.innerHTML = '<div class="mm-empty-state">暂无物品数据</div>';
         } else {
-            itemsEl.innerHTML = data.items.map((item, i) =>
-                `<div class="mm-entry-card" data-type="item" data-index="${i}">` +
+            itemsEl.innerHTML = data.items.map((item, i) => {
+                const sigLabel = item.significance === 'high' ? '重要' : '普通';
+                const sigClass = item.significance === 'high' ? 'mm-sig-high' : 'mm-sig-medium';
+                return `<div class="mm-entry-card" data-type="item" data-index="${i}">` +
                     `<div class="mm-entry-header">` +
                         `<span class="mm-entry-name">${escapeHtml(item.name)}</span>` +
-                        `<span class="mm-entry-summary">${escapeHtml(item.status || '')}${item.significance ? ' (' + escapeHtml(item.significance) + ')' : ''}</span>` +
+                        `<span class="mm-entry-significance ${sigClass}">${sigLabel}</span>` +
                         `<span class="mm-entry-actions">` +
                             `<button class="mm-entry-btn mm-btn-edit-entry" data-index="${i}">编辑</button>` +
                             `<button class="mm-entry-btn mm-btn-del-entry" data-index="${i}">删除</button>` +
                         `</span>` +
                     `</div>` +
+                    `<div class="mm-entry-body">` +
+                        `<div class="mm-entry-field"><span class="mm-entry-field-label">状态</span><span class="mm-entry-field-value">${escapeHtml(item.status || '(未设定)')}</span></div>` +
+                    `</div>` +
                     `<div class="mm-entry-edit-panel" style="display:none"></div>` +
-                `</div>`
-            ).join('');
+                `</div>`;
+            }).join('');
         }
         itemsEl.querySelectorAll('.mm-btn-edit-entry').forEach(btn => {
             btn.addEventListener('click', () => openEditItem(Number(btn.dataset.index)));
@@ -3632,6 +3899,7 @@ function updateBrowserUI() {
                 <div class="mm-memory-card ${levelClass}" data-id="${p.id}">
                     <div class="mm-memory-card-header">
                         <span class="mm-memory-card-day">${escapeHtml(p.day)}</span>
+                        ${p.date ? `<span class="mm-memory-card-date">${escapeHtml(p.date)}</span>` : ''}
                         <span class="mm-memory-card-title">${escapeHtml(p.title)}</span>
                         <span class="mm-memory-card-sig mm-sig-${p.significance}">
                             ${p.significance === 'high' ? '!!' : '!'}

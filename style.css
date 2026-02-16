@@ -293,6 +293,12 @@
     font-weight: 600;
 }
 
+.mm-memory-card-date {
+    font-size: 10px;
+    opacity: 0.6;
+    color: var(--SmartThemeBodyColor, #aaa);
+}
+
 .mm-memory-card-title {
     flex: 1;
     font-weight: 500;
@@ -434,20 +440,23 @@
 /* ── Recall Floating Ball (悬浮球) ── */
 
 .mm-recall-fab {
-    position: fixed;
+    position: fixed !important;
     width: 64px;
     height: 64px;
     background: transparent;
     border: none;
-    display: flex;
+    display: flex !important;
     align-items: center;
     justify-content: center;
     cursor: grab;
-    z-index: 1000;
+    z-index: 99990 !important;
     padding: 0;
     touch-action: none;
     -webkit-user-select: none;
     user-select: none;
+    pointer-events: auto !important;
+    visibility: visible !important;
+    opacity: 1 !important;
 }
 
 .mm-recall-fab:active {
@@ -487,19 +496,31 @@
 }
 
 .mm-recall-panel {
-    position: fixed;
+    position: fixed !important;
     width: 380px;
     max-width: calc(100vw - 16px);
     max-height: 500px;
     border-radius: 12px;
-    background: var(--SmartThemeBlurTintColor, rgba(20, 20, 35, 0.95));
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.12));
-    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-    z-index: 1001;
-    display: flex;
+    background: rgba(255, 255, 255, 0.92) !important;
+    border: 1px solid rgba(0,0,0,0.1);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.18);
+    z-index: 99991 !important;
     flex-direction: column;
     overflow: hidden;
-    backdrop-filter: blur(12px);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    pointer-events: auto !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    color: #222;
+}
+
+/* Popover API: reset browser default popover styles */
+.mm-recall-panel[popover] {
+    margin: 0;
+    padding: 0;
+    border: 1px solid rgba(0,0,0,0.1);
+    inset: auto;
 }
 
 .mm-recall-panel-header {
@@ -507,10 +528,10 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 14px;
-    border-bottom: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.08));
+    border-bottom: 1px solid rgba(0,0,0,0.08);
     font-weight: 600;
     font-size: 13px;
-    color: var(--SmartThemeBodyColor, #ddd);
+    color: #333;
 }
 
 .mm-recall-panel-close {
@@ -530,6 +551,8 @@
     padding: 10px 14px;
     flex: 1;
     max-height: 440px;
+    position: relative;
+    z-index: 1;
 }
 
 .mm-recall-panel-section {
@@ -545,7 +568,7 @@
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--SmartThemeBodyColor, #888);
+    color: #666;
     opacity: 0.6;
     margin-bottom: 6px;
 }
@@ -553,8 +576,8 @@
 .mm-recall-panel-page {
     padding: 8px 10px;
     border-radius: 8px;
-    background: var(--SmartThemeBlurTintColor, rgba(255,255,255,0.04));
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.06));
+    background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.06);
     margin-bottom: 6px;
 }
 
@@ -568,8 +591,8 @@
 .mm-recall-panel-page-day {
     padding: 1px 5px;
     border-radius: 4px;
-    background: var(--SmartThemeQuoteColor, #555);
-    color: var(--SmartThemeBodyColor, #fff);
+    background: #6b9bd2;
+    color: #fff;
     font-size: 10px;
     font-weight: 600;
 }
@@ -577,13 +600,13 @@
 .mm-recall-panel-page-title {
     font-weight: 500;
     font-size: 13px;
-    color: var(--SmartThemeBodyColor, #ddd);
+    color: #333;
 }
 
 .mm-recall-panel-page-body {
     font-size: 12px;
     line-height: 1.6;
-    color: var(--SmartThemeBodyColor, #bbb);
+    color: #555;
     opacity: 0.85;
     font-style: italic;
 }
@@ -591,18 +614,18 @@
 .mm-recall-panel-char {
     padding: 8px 10px;
     border-radius: 8px;
-    background: var(--SmartThemeBlurTintColor, rgba(255,255,255,0.04));
-    border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.06));
+    background: rgba(0,0,0,0.04);
+    border: 1px solid rgba(0,0,0,0.06);
     margin-bottom: 6px;
     font-size: 12px;
     line-height: 1.6;
-    color: var(--SmartThemeBodyColor, #bbb);
+    color: #555;
 }
 
 .mm-recall-panel-char-name {
     font-weight: 600;
     font-size: 13px;
-    color: var(--SmartThemeBodyColor, #ddd);
+    color: #333;
     margin-bottom: 4px;
 }
 
@@ -747,6 +770,40 @@
 .mm-btn-del-entry {
     color: #ef4444;
     border-color: rgba(239, 68, 68, 0.3);
+}
+
+/* ── Entry Card Body (知识卡片展示区) ── */
+
+.mm-entry-body {
+    padding: 4px 8px 6px;
+    border-top: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.04));
+}
+
+.mm-entry-field {
+    display: flex;
+    gap: 6px;
+    padding: 2px 0;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.mm-entry-field-label {
+    flex-shrink: 0;
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--SmartThemeBodyColor, #999);
+    min-width: 28px;
+}
+
+.mm-entry-field-value {
+    color: var(--SmartThemeBodyColor, #bbb);
+    word-break: break-word;
+}
+
+.mm-entry-significance {
+    font-size: 10px;
+    font-weight: 500;
+    flex-shrink: 0;
 }
 
 /* ── Inline Edit Panel ── */
