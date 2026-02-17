@@ -869,6 +869,7 @@ function createDefaultData() {
         processing: {
             lastExtractedMessageId: -1,
             extractionInProgress: false,
+            extractedMsgDates: {},  // { [send_date]: true } — tracks which messages have been extracted
         },
 
         // Per-message recall records (for UI display)
@@ -1042,6 +1043,11 @@ function getMemoryData() {
     // Ensure embeddings object exists
     if (!d.embeddings || typeof d.embeddings !== 'object') {
         d.embeddings = {};
+    }
+
+    // Ensure extractedMsgDates exists (start empty for old data — force extract will re-scan)
+    if (!d.processing.extractedMsgDates) {
+        d.processing.extractedMsgDates = {};
     }
 
     return d;
@@ -2138,6 +2144,16 @@ function applyExtractionResult(data, result) {
     return newPageIds;
 }
 
+/** Mark messages as extracted by their send_date */
+function markMsgsExtracted(data, messages) {
+    if (!data.processing.extractedMsgDates) data.processing.extractedMsgDates = {};
+    for (const m of messages) {
+        if (m && m.send_date) {
+            data.processing.extractedMsgDates[m.send_date] = true;
+        }
+    }
+}
+
 async function performExtraction() {
     const ctx = getContext();
     const data = getMemoryData();
@@ -2182,6 +2198,7 @@ async function performExtraction() {
         }
 
         applyExtractionResult(data, result);
+        markMsgsExtracted(data, pendingMsgs);
         data.processing.lastExtractedMessageId = endIdx - 1;
         saveMemoryData();
     } else {
@@ -2224,6 +2241,7 @@ async function performExtraction() {
             }
 
             applyExtractionResult(data, result);
+            markMsgsExtracted(data, batch.map(item => item.msg));
             data.processing.lastExtractedMessageId = batchLastIdx;
             saveMemoryData();
             log(`Batch ${bi + 1}/${batches.length} done. Pages: ${data.pages.length}`);
@@ -2258,17 +2276,78 @@ async function safeExtract(force = false) {
     const data = getMemoryData();
     if (data.processing.extractionInProgress) {
         log('Extraction already in progress, skipping');
+        if (force) toastr?.warning?.('提取正在进行中，请等待完成', 'Memory Manager');
         return;
     }
 
     const ctx = getContext();
-    if (!ctx.chat || ctx.chat.length === 0) return;
-
-    const pendingCount = ctx.chat.length - 1 - data.processing.lastExtractedMessageId;
-    if (!force && pendingCount < s.extractionInterval) return;
+    if (!ctx.chat || ctx.chat.length === 0) {
+        if (force) toastr?.info?.('当前没有聊天记录', 'Memory Manager');
+        return;
+    }
 
     if (is_send_press) {
         log('Send in progress, deferring extraction');
+        if (force) toastr?.warning?.('消息发送中，请稍后再试', 'Memory Manager');
+        return;
+    }
+
+    if (force) {
+        // Force mode: use extractedMsgDates to find ALL unextracted messages
+        await forceExtractUnprocessed(data, ctx, s);
+    } else {
+        // Normal mode: watermark-based incremental extraction
+        const pendingCount = ctx.chat.length - 1 - data.processing.lastExtractedMessageId;
+        if (pendingCount < s.extractionInterval) return;
+
+        data.processing.extractionInProgress = true;
+        saveMemoryData();
+        setMood('thinking');
+
+        try {
+            await performExtraction();
+            consecutiveFailures = 0;
+            setMood('joyful', 5000);
+            await hideProcessedMessages();
+        } catch (err) {
+            warn('Extraction failed:', err);
+            setMood('sad', 5000);
+            consecutiveFailures++;
+            if (consecutiveFailures >= 3) {
+                toastr?.warning?.('记忆提取连续失败，请检查API状态', 'Memory Manager');
+                consecutiveFailures = 0;
+            }
+        } finally {
+            data.processing.extractionInProgress = false;
+            saveMemoryData();
+            updateStatusDisplay();
+        }
+    }
+}
+
+/**
+ * Force extraction: scan ALL chat messages, find unextracted ones by send_date marks,
+ * batch them, extract with retry logic.
+ */
+async function forceExtractUnprocessed(data, ctx, s) {
+    const dates = data.processing.extractedMsgDates || {};
+    const chat = ctx.chat;
+
+    // Buffer zone: skip last 4 messages
+    const BUFFER = 4;
+    const endIdx = Math.max(0, chat.length - BUFFER);
+
+    // Find all unextracted messages (including hidden ones — auto-hide sets is_system=true)
+    const unextracted = [];
+    for (let i = 0; i < endIdx; i++) {
+        const m = chat[i];
+        if (!m || !m.mes) continue;
+        if (m.send_date && dates[m.send_date]) continue; // already extracted
+        unextracted.push({ msg: m, idx: i });
+    }
+
+    if (unextracted.length === 0) {
+        toastr?.info?.('所有消息均已提取，没有需要处理的内容', 'Memory Manager');
         return;
     }
 
@@ -2276,19 +2355,137 @@ async function safeExtract(force = false) {
     saveMemoryData();
     setMood('thinking');
 
+    const BATCH_SIZE = 20;
+    const batches = [];
+    for (let i = 0; i < unextracted.length; i += BATCH_SIZE) {
+        batches.push(unextracted.slice(i, i + BATCH_SIZE));
+    }
+
+    const totalBatches = batches.length;
+    let successCount = 0;
+    let forceFailedBatches = [];
+    const initMaxTokens = Math.max(s.extractionMaxTokens, 8192);
+
+    toastr?.info?.(`发现 ${unextracted.length} 条未提取消息，分 ${totalBatches} 批处理...`, 'Memory Manager', { timeOut: 5000 });
+    updateInitProgressUI(0, totalBatches, `强制提取: ${unextracted.length} 条未提取消息`);
+
     try {
-        await performExtraction();
-        consecutiveFailures = 0;
-        setMood('joyful', 5000);
-        await hideProcessedMessages();
-    } catch (err) {
-        warn('Extraction failed:', err);
-        setMood('sad', 5000);
-        consecutiveFailures++;
-        if (consecutiveFailures >= 3) {
-            toastr?.warning?.('记忆提取连续失败，请检查API状态', 'Memory Manager');
-            consecutiveFailures = 0;
+        for (let bi = 0; bi < totalBatches; bi++) {
+            const batch = batches[bi];
+            const batchText = batch.map(item => `${item.msg.name}: ${item.msg.mes}`).join('\n\n');
+            const batchLastIdx = batch[batch.length - 1].idx;
+
+            updateInitProgressUI(bi, totalBatches, `正在提取第 ${bi + 1}/${totalBatches} 批...`);
+
+            try {
+                const prompt = buildExtractionPrompt(data, batchText);
+                const response = await callLLM(
+                    '你是剧情记忆管理系统。严格按要求输出JSON。',
+                    prompt,
+                    initMaxTokens,
+                );
+
+                const result = parseJsonResponse(response);
+                if (!result) {
+                    warn(`Force batch ${bi + 1}: Failed to parse response`);
+                    forceFailedBatches.push({ index: bi, batch, reason: '解析失败' });
+                    continue;
+                }
+
+                applyExtractionResult(data, result);
+                markMsgsExtracted(data, batch.map(item => item.msg));
+
+                // Advance watermark if applicable
+                if (batchLastIdx > data.processing.lastExtractedMessageId) {
+                    data.processing.lastExtractedMessageId = batchLastIdx;
+                }
+
+                saveMemoryData();
+                successCount++;
+                log(`Force batch ${bi + 1}/${totalBatches} done. Pages: ${data.pages.length}`);
+            } catch (err) {
+                warn(`Force batch ${bi + 1} failed:`, err);
+                forceFailedBatches.push({ index: bi, batch, reason: err.message });
+            }
         }
+
+        // Retry failed batches once
+        if (forceFailedBatches.length > 0) {
+            const retryList = [...forceFailedBatches];
+            forceFailedBatches = [];
+            toastr?.info?.(`重试 ${retryList.length} 个失败批次...`, 'Memory Manager', { timeOut: 3000 });
+
+            for (let ri = 0; ri < retryList.length; ri++) {
+                const { batch } = retryList[ri];
+                const batchText = batch.map(item => `${item.msg.name}: ${item.msg.mes}`).join('\n\n');
+                const batchLastIdx = batch[batch.length - 1].idx;
+
+                updateInitProgressUI(ri, retryList.length, `重试第 ${ri + 1}/${retryList.length} 批...`);
+
+                try {
+                    const prompt = buildExtractionPrompt(data, batchText);
+                    const response = await callLLM(
+                        '你是剧情记忆管理系统。严格按要求输出JSON。',
+                        prompt,
+                        initMaxTokens,
+                    );
+
+                    const result = parseJsonResponse(response);
+                    if (!result) {
+                        forceFailedBatches.push({ index: retryList[ri].index, batch, reason: '重试解析失败' });
+                        continue;
+                    }
+
+                    applyExtractionResult(data, result);
+                    markMsgsExtracted(data, batch.map(item => item.msg));
+
+                    if (batchLastIdx > data.processing.lastExtractedMessageId) {
+                        data.processing.lastExtractedMessageId = batchLastIdx;
+                    }
+
+                    saveMemoryData();
+                    successCount++;
+                } catch (err) {
+                    warn(`Force retry batch failed:`, err);
+                    forceFailedBatches.push({ index: retryList[ri].index, batch, reason: err.message });
+                }
+            }
+        }
+
+        // Report results
+        if (forceFailedBatches.length > 0) {
+            updateInitProgressUI(totalBatches, totalBatches, `完成！${forceFailedBatches.length} 批失败`);
+            setMood('sad', 6000);
+            toastr?.warning?.(
+                `强制提取完成: ${successCount} 批成功，${forceFailedBatches.length} 批仍失败`,
+                'Memory Manager', { timeOut: 8000 },
+            );
+        } else {
+            updateInitProgressUI(totalBatches, totalBatches, '强制提取完成！');
+            setMood('joyful', 5000);
+            toastr?.success?.(
+                `强制提取完成！${successCount} 批全部成功，当前共 ${data.pages.length} 个故事页`,
+                'Memory Manager', { timeOut: 8000 },
+            );
+            hideInitProgressUI();
+        }
+
+        // Post-extraction tasks
+        if (isEmbeddingConfigured()) {
+            const newPages = data.pages.filter(p => !data.embeddings[p.id] && p.compressionLevel <= COMPRESS_SUMMARY);
+            for (const page of newPages) {
+                await embedPage(page);
+            }
+        }
+        await safeCompress(false);
+        await autoSaveIfEnabled();
+        await hideProcessedMessages();
+        updateBrowserUI();
+
+    } catch (err) {
+        warn('Force extraction error:', err);
+        setMood('sad', 5000);
+        toastr?.error?.('强制提取出错: ' + err.message, 'Memory Manager');
     } finally {
         data.processing.extractionInProgress = false;
         saveMemoryData();
@@ -2438,13 +2635,19 @@ async function compressTimeline(data) {
 async function runCompressionCycle(data, force = false) {
     const s = getSettings();
     const anyEnabled = s.compressTimeline || s.compressPages || s.archiveDaily;
-    if (!anyEnabled && !force) return;
+    if (!anyEnabled && !force) return { compressed: 0, archived: 0, timeline: false };
 
     log('Running compression cycle...');
+    let compressedCount = 0;
+    let archivedCount = 0;
+    let timelineCompressed = false;
 
     // 1. Compress timeline if too long
     if (s.compressTimeline || force) {
+        const beforeLen = (data.timeline || []).length;
         await compressTimeline(data);
+        const afterLen = (data.timeline || []).length;
+        if (afterLen < beforeLen) timelineCompressed = true;
     }
 
     // 2. Compress old L0 pages to L1 (optional)
@@ -2459,6 +2662,7 @@ async function runCompressionCycle(data, force = false) {
             for (const page of toCompress) {
                 await compressPage(data, page.id);
                 saveMemoryData();
+                compressedCount++;
             }
         }
     }
@@ -2479,6 +2683,7 @@ async function runCompressionCycle(data, force = false) {
                 log('Archiving', toArchive.length, 'daily pages (total', totalPages, '>', s.archiveThreshold, ')');
                 for (const page of toArchive) {
                     archivePage(data, page.id);
+                    archivedCount++;
                 }
             }
         }
@@ -2486,17 +2691,27 @@ async function runCompressionCycle(data, force = false) {
 
     saveMemoryData();
     log('Compression cycle complete. Total pages:', data.pages.length);
+    return { compressed: compressedCount, archived: archivedCount, timeline: timelineCompressed };
 }
 
 async function safeCompress(force = false) {
     try {
         setMood('angry');
         const data = getMemoryData();
-        await runCompressionCycle(data, force);
+        if (force) toastr?.info?.('开始压缩...', 'Memory Manager', { timeOut: 3000 });
+        const result = await runCompressionCycle(data, force);
         setMood('idle');
         updateBrowserUI();
         if (force) {
-            toastr?.success?.('压缩完成', 'Memory Manager');
+            const parts = [];
+            if (result && result.compressed > 0) parts.push(`${result.compressed} 页压缩`);
+            if (result && result.archived > 0) parts.push(`${result.archived} 页归档`);
+            if (result && result.timeline) parts.push('时间线已压缩');
+            if (parts.length > 0) {
+                toastr?.success?.(`压缩完成: ${parts.join('，')}`, 'Memory Manager');
+            } else {
+                toastr?.info?.('当前没有需要压缩的内容', 'Memory Manager');
+            }
         }
     } catch (err) {
         warn('Compression cycle failed:', err);
@@ -3417,6 +3632,62 @@ function bindRecallFab() {
 let initializationInProgress = false;
 let failedBatches = []; // Store failed batches for retry
 
+/**
+ * Show a dialog for the user to confirm initialization and specify message range.
+ * Returns { startMsg, endMsg } or null if cancelled.
+ */
+function showInitRangeDialog(totalMsgs) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);z-index:100000;display:flex;align-items:center;justify-content:center;';
+        const dialog = document.createElement('div');
+        dialog.style.cssText = 'background:#fff;color:#222;border-radius:12px;padding:20px;max-width:380px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,0.3);font-size:14px;line-height:1.6;';
+        dialog.innerHTML = `
+            <div style="font-weight:600;font-size:16px;margin-bottom:12px;">初始化记忆库</div>
+            <div style="margin-bottom:12px;">
+                当前聊天共 <b>${totalMsgs}</b> 条有效消息（不含系统消息）。
+            </div>
+            <div style="margin-bottom:8px;">初始化将：</div>
+            <ul style="margin:0 0 12px 16px;padding:0;">
+                <li>重置当前记忆数据</li>
+                <li>分批处理指定范围的消息</li>
+                <li>构建故事索引、故事页和角色档案</li>
+            </ul>
+            <div style="margin-bottom:8px;font-weight:500;">提取消息范围：</div>
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;">
+                <span>第</span>
+                <input id="mm_init_start" type="number" min="1" max="${totalMsgs}" value="1"
+                    style="width:70px;padding:4px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:center;">
+                <span>条 — 第</span>
+                <input id="mm_init_end" type="number" min="1" max="${totalMsgs}" value="${totalMsgs}"
+                    style="width:70px;padding:4px 8px;border:1px solid #ccc;border-radius:6px;font-size:14px;text-align:center;">
+                <span>条</span>
+            </div>
+            <div style="display:flex;gap:8px;justify-content:flex-end;">
+                <button id="mm_init_cancel" style="padding:6px 16px;border:1px solid #ccc;border-radius:6px;background:#f5f5f5;cursor:pointer;font-size:14px;">取消</button>
+                <button id="mm_init_confirm" style="padding:6px 16px;border:none;border-radius:6px;background:#4f8ef7;color:#fff;cursor:pointer;font-size:14px;font-weight:500;">开始初始化</button>
+            </div>
+        `;
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        const cleanup = (result) => {
+            overlay.remove();
+            resolve(result);
+        };
+
+        overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(null); });
+        dialog.querySelector('#mm_init_cancel').addEventListener('click', () => cleanup(null));
+        dialog.querySelector('#mm_init_confirm').addEventListener('click', () => {
+            const startVal = parseInt(dialog.querySelector('#mm_init_start').value, 10);
+            const endVal = parseInt(dialog.querySelector('#mm_init_end').value, 10);
+            const startMsg = Math.max(1, Math.min(startVal || 1, totalMsgs));
+            const endMsg = Math.max(startMsg, Math.min(endVal || totalMsgs, totalMsgs));
+            cleanup({ startMsg, endMsg });
+        });
+    });
+}
+
 async function performBatchInitialization() {
     if (initializationInProgress) {
         toastr?.warning?.('初始化正在进行中，请耐心等待', 'Memory Manager');
@@ -3429,15 +3700,14 @@ async function performBatchInitialization() {
         return;
     }
 
-    const confirmed = confirm(
-        '即将从现有聊天记录构建记忆库。\n\n'
-        + '这将：\n'
-        + '• 重置当前的记忆数据\n'
-        + '• 分批处理所有消息（使用副API / 主API）\n'
-        + '• 构建故事索引、故事页和角色档案\n\n'
-        + '如聊天较长，可能需要多次API调用。是否继续？'
-    );
-    if (!confirmed) return;
+    // Count messages for display (include hidden — auto-hide sets is_system=true)
+    const totalMsgs = ctx.chat.filter(m => m && m.mes).length;
+
+    // Show range selection dialog
+    const rangeResult = await showInitRangeDialog(totalMsgs);
+    if (!rangeResult) return; // user cancelled
+
+    const { startMsg, endMsg } = rangeResult;
 
     initializationInProgress = true;
     setMood('thinking');
@@ -3451,10 +3721,17 @@ async function performBatchInitialization() {
     data.processing.extractionInProgress = true;
     saveMemoryData();
 
-    // Collect all non-system messages
-    const allMessages = ctx.chat
-        .map((m, i) => ({ msg: m, idx: i }))
-        .filter(item => !item.msg.is_system && item.msg.mes);
+    // Collect messages within the user-specified range (include hidden ones)
+    let msgCounter = 0;
+    const allMessages = [];
+    for (let i = 0; i < ctx.chat.length; i++) {
+        const m = ctx.chat[i];
+        if (!m || !m.mes) continue;
+        msgCounter++;
+        if (msgCounter >= startMsg && msgCounter <= endMsg) {
+            allMessages.push({ msg: m, idx: i });
+        }
+    }
 
     // Gather world book context (不含角色卡 — 角色卡是角色设定，不是剧情记忆)
     updateInitProgressUI(0, 0, '正在读取世界书...');
@@ -3527,6 +3804,8 @@ async function performBatchInitialization() {
                     for (const p of newPages) {
                         p.sourceMessages = batch.sourceIds;
                     }
+                    // Mark messages as extracted by send_date
+                    markMsgsExtracted(data, batch.sourceIds.map(idx => ctx.chat[idx]).filter(Boolean));
                     data.processing.lastExtractedMessageId = batch.lastIdx;
                 }
 
@@ -3633,6 +3912,8 @@ async function retryFailedBatches() {
                     for (const p of newPages) {
                         p.sourceMessages = batch.sourceIds;
                     }
+                    const ctx = getContext();
+                    markMsgsExtracted(data, batch.sourceIds.map(idx => ctx.chat[idx]).filter(Boolean));
                     if (batch.lastIdx > data.processing.lastExtractedMessageId) {
                         data.processing.lastExtractedMessageId = batch.lastIdx;
                     }
@@ -3957,9 +4238,31 @@ function updateBrowserUI() {
 function updateStatusDisplay() {
     const ctx = getContext();
     const data = getMemoryData();
-    const processed = data.processing.lastExtractedMessageId;
-    const total = ctx.chat ? ctx.chat.length - 1 : 0;
-    const pending = Math.max(0, total - processed);
+    const dates = data.processing.extractedMsgDates || {};
+    const hasMarks = Object.keys(dates).length > 0;
+
+    let extractedCount, pending;
+
+    if (hasMarks) {
+        // New system: count by send_date marks (include hidden messages)
+        let totalMessages = 0;
+        extractedCount = 0;
+        if (ctx.chat) {
+            for (let i = 0; i < ctx.chat.length; i++) {
+                const m = ctx.chat[i];
+                if (!m || !m.mes) continue;
+                totalMessages++;
+                if (m.send_date && dates[m.send_date]) extractedCount++;
+            }
+        }
+        pending = Math.max(0, totalMessages - extractedCount);
+    } else {
+        // Fallback for old data: use watermark
+        const processed = data.processing.lastExtractedMessageId;
+        const total = ctx.chat ? ctx.chat.length - 1 : 0;
+        extractedCount = Math.max(0, processed);
+        pending = Math.max(0, total - extractedCount);
+    }
 
     const statusEl = document.getElementById('mm_status_text');
     if (statusEl) {
@@ -3967,10 +4270,57 @@ function updateStatusDisplay() {
     }
 
     const processedEl = document.getElementById('mm_processed_count');
-    if (processedEl) processedEl.textContent = Math.max(0, processed);
+    if (processedEl) processedEl.textContent = extractedCount;
 
     const pendingEl = document.getElementById('mm_pending_count');
     if (pendingEl) pendingEl.textContent = pending;
+
+    updateUnextractedBadges();
+}
+
+const ROBOT_SVG = '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9 15a1 1 0 100 2 1 1 0 000-2z" fill="currentColor"/><path d="M14 16a1 1 0 112 0 1 1 0 01-2 0z" fill="currentColor"/><path fill-rule="evenodd" clip-rule="evenodd" d="M12 1a2 2 0 00-1 3.732V7H6a3 3 0 00-3 3v10a3 3 0 003 3h12a3 3 0 003-3V10a3 3 0 00-3-3h-5V4.732A2 2 0 0012 1zM5 10a1 1 0 011-1h1.382l1.447 2.894A2 2 0 0010.618 13h2.764a2 2 0 001.789-1.106L16.618 9H18a1 1 0 011 1v10a1 1 0 01-1 1H6a1 1 0 01-1-1V10zm8.382 1l1-2H9.618l1 2h2.764z" fill="currentColor"/><path d="M1 14a1 1 0 00-1 1v2a1 1 0 102 0v-2a1 1 0 00-1-1zM22 15a1 1 0 112 0v2a1 1 0 11-2 0v-2z" fill="currentColor"/></svg>';
+
+/**
+ * Add/remove robot badge on chat messages to indicate unextracted status.
+ */
+function updateUnextractedBadges() {
+    const ctx = getContext();
+    if (!ctx.chat) return;
+
+    const data = getMemoryData();
+    const dates = data.processing.extractedMsgDates || {};
+    const hasMarks = Object.keys(dates).length > 0;
+
+    // If no marks yet (old data), don't show badges — would mark everything
+    if (!hasMarks) return;
+
+    const mesElements = document.querySelectorAll('.mes[mesid]');
+    for (const el of mesElements) {
+        const mesId = parseInt(el.getAttribute('mesid'), 10);
+        if (isNaN(mesId) || mesId < 0 || mesId >= ctx.chat.length) continue;
+
+        const m = ctx.chat[mesId];
+        if (!m || !m.mes) continue;
+
+        const isExtracted = m.send_date && dates[m.send_date];
+        const existing = el.querySelector('.mm-unextracted-badge');
+
+        if (!isExtracted && !existing) {
+            // Add badge
+            const badge = document.createElement('span');
+            badge.className = 'mm-unextracted-badge';
+            badge.title = '此消息尚未被记忆管理器提取';
+            badge.innerHTML = ROBOT_SVG;
+            // Insert after .name_text or .mes_ghost
+            const nameArea = el.querySelector('.name_text');
+            if (nameArea) {
+                nameArea.after(badge);
+            }
+        } else if (isExtracted && existing) {
+            // Remove badge
+            existing.remove();
+        }
+    }
 }
 
 // ============================================================
@@ -4359,6 +4709,8 @@ function onChatChanged() {
 
     updateBrowserUI();
     hideProcessedMessages();
+    // Delay badge update to let DOM render
+    setTimeout(updateUnextractedBadges, 1000);
 }
 
 function onMessageRendered(messageId) {
@@ -4369,6 +4721,8 @@ function onMessageRendered(messageId) {
             saveMemoryData();
         }
     }
+    // Update unextracted badge for this specific message
+    updateUnextractedBadges();
 }
 
 // ============================================================

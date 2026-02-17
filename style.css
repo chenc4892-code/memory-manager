@@ -521,6 +521,10 @@
     padding: 0;
     border: 1px solid rgba(0,0,0,0.1);
     inset: auto;
+    height: auto;
+    width: auto;
+    min-height: 200px;
+    overflow: visible;
 }
 
 .mm-recall-panel-header {
@@ -913,4 +917,25 @@
     text-align: right;
     opacity: 0.6;
     color: var(--SmartThemeBodyColor, #aaa);
+}
+
+/* ── Unextracted message badge ── */
+.mm-unextracted-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    margin-left: 4px;
+    vertical-align: middle;
+    opacity: 0.5;
+    cursor: help;
+    flex-shrink: 0;
+}
+.mm-unextracted-badge svg {
+    width: 14px;
+    height: 14px;
+}
+.mm-unextracted-badge:hover {
+    opacity: 0.9;
 }
