@@ -1990,10 +1990,77 @@ ${messages}
 ]`;
 }
 
-function applyExtractionResult(data, result) {
-    // Update timeline
+/**
+ * Merge timelines: prevent data loss when LLM outputs incomplete timeline.
+ * If new timeline looks complete (covers same range, similar entry count), use it as-is.
+ * Otherwise, merge by keeping old entries not covered by new entries.
+ */
+function mergeTimelines(oldTimeline, newTimeline) {
+    if (!oldTimeline || !oldTimeline.trim()) return newTimeline || '';
+    if (!newTimeline || !newTimeline.trim()) return oldTimeline;
+
+    // Parse timeline text into entries with day ranges
+    function parseEntries(text) {
+        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+        return lines.map(line => {
+            const match = line.match(/^D(\d+)(?:\s*[-–—~]\s*D?(\d+))?/i);
+            if (!match) return { line, start: -1, end: -1 };
+            const start = parseInt(match[1]);
+            const end = match[2] ? parseInt(match[2]) : start;
+            return { line, start, end };
+        });
+    }
+
+    const oldEntries = parseEntries(oldTimeline);
+    const newEntries = parseEntries(newTimeline);
+
+    const oldDEntries = oldEntries.filter(e => e.start >= 0);
+    const newDEntries = newEntries.filter(e => e.start >= 0);
+
+    if (newDEntries.length === 0) return oldTimeline;
+    if (oldDEntries.length === 0) return newTimeline;
+
+    const oldMaxDay = Math.max(...oldDEntries.map(e => e.end));
+    const newMaxDay = Math.max(...newDEntries.map(e => e.end));
+
+    // If new timeline covers same/more range with reasonable entry count, trust it
+    if (newMaxDay >= oldMaxDay && newDEntries.length >= oldDEntries.length * 0.6) {
+        return newTimeline;
+    }
+
+    // Merge: keep old entries whose day range is NOT fully covered by new entries
+    const newCoveredDays = new Set();
+    for (const entry of newDEntries) {
+        for (let d = entry.start; d <= entry.end; d++) {
+            newCoveredDays.add(d);
+        }
+    }
+
+    const keptOld = oldDEntries.filter(entry => {
+        for (let d = entry.start; d <= entry.end; d++) {
+            if (!newCoveredDays.has(d)) return true;
+        }
+        return false;
+    });
+
+    // Combine and sort by start day
+    const merged = [...keptOld, ...newDEntries];
+    merged.sort((a, b) => a.start - b.start);
+
+    // Keep non-D lines from new timeline (rare but possible)
+    const nonDNew = newEntries.filter(e => e.start < 0);
+    const result = merged.map(e => e.line);
+    for (const e of nonDNew) {
+        result.push(e.line);
+    }
+
+    return result.join('\n');
+}
+
+function applyExtractionResult(data, result, sourceDates = []) {
+    // Update timeline (merge to prevent data loss from weak LLM outputs)
     if (result.timeline) {
-        data.timeline = result.timeline;
+        data.timeline = mergeTimelines(data.timeline, result.timeline);
     }
 
     const ctx = getContext();
@@ -2135,6 +2202,7 @@ function applyExtractionResult(data, result) {
                 significance: page.significance || 'medium',
                 compressionLevel: COMPRESS_FRESH,
                 sourceMessages: [],
+                sourceDates: [...sourceDates],
                 createdAt: Date.now(),
                 compressedAt: null,
             });
@@ -2197,7 +2265,7 @@ async function performExtraction() {
             throw new Error('Failed to parse extraction response');
         }
 
-        applyExtractionResult(data, result);
+        applyExtractionResult(data, result, pendingMsgs.filter(m => m.send_date).map(m => m.send_date));
         markMsgsExtracted(data, pendingMsgs);
         data.processing.lastExtractedMessageId = endIdx - 1;
         saveMemoryData();
@@ -2240,7 +2308,7 @@ async function performExtraction() {
                 continue;
             }
 
-            applyExtractionResult(data, result);
+            applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
             markMsgsExtracted(data, batch.map(item => item.msg));
             data.processing.lastExtractedMessageId = batchLastIdx;
             saveMemoryData();
@@ -2293,8 +2361,41 @@ async function safeExtract(force = false) {
     }
 
     if (force) {
-        // Force mode: use extractedMsgDates to find ALL unextracted messages
-        await forceExtractUnprocessed(data, ctx, s);
+        // Force mode: protect save before processing
+        const charName = getCurrentCharName();
+        if (charName) {
+            const activeSlot = getActiveSlotName(charName);
+            if (activeSlot) {
+                // Auto-backup existing save before force extract
+                const backupName = `${activeSlot}-备份`;
+                try {
+                    await saveToSlot(charName, backupName);
+                    // saveToSlot changes activeSlot — restore it
+                    const idx = getSaveIndex();
+                    if (idx[charName]) idx[charName].activeSlot = activeSlot;
+                    saveSettingsDebounced();
+                    log('Auto-backup created:', backupName);
+                    toastr?.info?.(`已自动备份到「${backupName}」`, 'Memory Manager');
+                } catch (e) {
+                    warn('Auto-backup before force extract failed:', e);
+                }
+
+                // Auto-load save if current data is empty (prevents overwriting good save with empty data)
+                if (!data.timeline && data.pages.length === 0) {
+                    try {
+                        await loadFromSlot(charName, activeSlot);
+                        log('Auto-loaded save before force extract:', activeSlot);
+                        toastr?.info?.(`已自动加载存档「${activeSlot}」`, 'Memory Manager');
+                    } catch (e) {
+                        warn('Auto-load before force extract failed:', e);
+                    }
+                }
+            }
+        }
+
+        // Re-get data reference after potential loadFromSlot (which replaces ctx.chatMetadata.memoryManager)
+        const freshData = getMemoryData();
+        await forceExtractUnprocessed(freshData, ctx, s);
     } else {
         // Normal mode: watermark-based incremental extraction
         const pendingCount = ctx.chat.length - 1 - data.processing.lastExtractedMessageId;
@@ -2392,7 +2493,7 @@ async function forceExtractUnprocessed(data, ctx, s) {
                     continue;
                 }
 
-                applyExtractionResult(data, result);
+                applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
                 markMsgsExtracted(data, batch.map(item => item.msg));
 
                 // Advance watermark if applicable
@@ -2436,7 +2537,7 @@ async function forceExtractUnprocessed(data, ctx, s) {
                         continue;
                     }
 
-                    applyExtractionResult(data, result);
+                    applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
                     markMsgsExtracted(data, batch.map(item => item.msg));
 
                     if (batchLastIdx > data.processing.lastExtractedMessageId) {
@@ -3796,7 +3897,12 @@ async function performBatchInitialization() {
 
                 console.warn(LOG_PREFIX, `Batch ${ci + 1}: parsed OK — timeline=${!!result.timeline}, chars=${result.characters?.length || 0}, pages=${result.newPages?.length || 0}`);
 
-                applyExtractionResult(data, result);
+                // Collect source dates for tracing
+                const batchSourceDates = (batch.type === 'chat' && batch.sourceIds.length > 0)
+                    ? batch.sourceIds.map(idx => ctx.chat[idx]?.send_date).filter(Boolean)
+                    : [];
+
+                applyExtractionResult(data, result, batchSourceDates);
 
                 // Tag source messages for new pages (only for chat batches)
                 if (batch.type === 'chat' && batch.sourceIds.length > 0) {
@@ -3905,15 +4011,19 @@ async function retryFailedBatches() {
                     continue;
                 }
 
-                applyExtractionResult(data, result);
+                const retryCtx = getContext();
+                const retrySourceDates = (batch.type === 'chat' && batch.sourceIds.length > 0)
+                    ? batch.sourceIds.map(idx => retryCtx.chat[idx]?.send_date).filter(Boolean)
+                    : [];
+
+                applyExtractionResult(data, result, retrySourceDates);
 
                 if (batch.type === 'chat' && batch.sourceIds.length > 0) {
                     const newPages = data.pages.filter(p => p.sourceMessages.length === 0);
                     for (const p of newPages) {
                         p.sourceMessages = batch.sourceIds;
                     }
-                    const ctx = getContext();
-                    markMsgsExtracted(data, batch.sourceIds.map(idx => ctx.chat[idx]).filter(Boolean));
+                    markMsgsExtracted(data, batch.sourceIds.map(idx => retryCtx.chat[idx]).filter(Boolean));
                     if (batch.lastIdx > data.processing.lastExtractedMessageId) {
                         data.processing.lastExtractedMessageId = batch.lastIdx;
                     }
@@ -4243,26 +4353,24 @@ function updateStatusDisplay() {
 
     let extractedCount, pending;
 
-    if (hasMarks) {
-        // New system: count by send_date marks (include hidden messages)
-        let totalMessages = 0;
-        extractedCount = 0;
-        if (ctx.chat) {
-            for (let i = 0; i < ctx.chat.length; i++) {
-                const m = ctx.chat[i];
-                if (!m || !m.mes) continue;
-                totalMessages++;
-                if (m.send_date && dates[m.send_date]) extractedCount++;
-            }
+    // Count total valid messages
+    let totalMessages = 0;
+    let dateBasedCount = 0;
+    if (ctx.chat) {
+        for (let i = 0; i < ctx.chat.length; i++) {
+            const m = ctx.chat[i];
+            if (!m || !m.mes) continue;
+            totalMessages++;
+            if (hasMarks && m.send_date && dates[m.send_date]) dateBasedCount++;
         }
-        pending = Math.max(0, totalMessages - extractedCount);
-    } else {
-        // Fallback for old data: use watermark
-        const processed = data.processing.lastExtractedMessageId;
-        const total = ctx.chat ? ctx.chat.length - 1 : 0;
-        extractedCount = Math.max(0, processed);
-        pending = Math.max(0, total - extractedCount);
     }
+
+    // Watermark-based count (from older extraction system)
+    const watermarkCount = Math.max(0, data.processing.lastExtractedMessageId);
+
+    // Use the higher of both methods to handle mixed old/new data
+    extractedCount = Math.max(dateBasedCount, watermarkCount);
+    pending = Math.max(0, totalMessages - extractedCount);
 
     const statusEl = document.getElementById('mm_status_text');
     if (statusEl) {
