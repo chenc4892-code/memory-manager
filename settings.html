@@ -25,6 +25,17 @@
       <!-- Main Content (hidden until authorized) -->
       <div id="mm_main_content" style="display:none">
 
+        <!-- Settings Lock Bar -->
+        <div id="mm_lock_bar" class="mm-lock-bar">
+          <button id="mm_settings_lock_btn" class="mm-lock-btn" title="防误触锁">
+            <i class="fa-solid fa-lock-open"></i>
+            <span id="mm_lock_label">防误触</span>
+          </button>
+        </div>
+
+        <!-- All settings below are disabled when locked -->
+        <div id="mm_settings_body" class="mm-settings-body">
+
         <!-- Basic Controls -->
         <div class="mm-section">
           <label class="checkbox_label" for="mm_enabled">
@@ -66,12 +77,33 @@
         </div>
         <hr />
 
+        <!-- NPC Injection Mode -->
+        <div class="mm-section">
+          <div class="mm-section-title">NPC 注入模式</div>
+          <select id="mm_npc_injection_mode" class="text_pole">
+            <option value="half">半注入（仅名字+身份，省 token）</option>
+            <option value="full">全注入（始终注入完整档案）</option>
+            <option value="keyword">关键词激活（按需注入）</option>
+          </select>
+          <small style="opacity:0.6; display:block; margin-top:4px">
+            半注入：Layer 1 只显示 NPC 名字+身份简介，档案按需由 embedding 召回。<br>
+            全注入：所有 NPC 完整档案始终在上下文中，适合 NPC 较少的玩家。<br>
+            关键词激活：扫描最近 N 条消息，含有角色关键词时才注入完整档案，其余只显示名字。
+          </small>
+          <div id="mm_npc_keyword_fields" style="display:none; margin-top:6px;">
+            <label for="mm_npc_keyword_scan_depth">扫描最近 N 条消息</label>
+            <input id="mm_npc_keyword_scan_depth" class="text_pole" type="number" min="1" max="20" value="4" />
+            <small style="opacity:0.6; display:block">关键词在最近 N 条消息中出现即激活完整档案，其余 NPC 仅显示名字。</small>
+          </div>
+        </div>
+        <hr />
+
         <!-- Injection Settings -->
         <div class="mm-section">
           <div class="mm-section-title">注入设置</div>
           <label for="mm_index_depth">故事索引注入深度 (depth)</label>
           <input id="mm_index_depth" class="text_pole" type="number" min="0" max="9999" value="9999" />
-          <small style="opacity:0.6">故事索引始终注入，类似目录索引，保持紧凑。</small>
+          <small style="opacity:0.6; display:block">故事索引始终注入，类似目录索引，保持紧凑。</small>
 
           <label for="mm_recall_depth">故事页/角色档案注入深度 (depth)</label>
           <input id="mm_recall_depth" class="text_pole" type="number" min="0" max="100" value="2" />
@@ -144,14 +176,6 @@
           <div class="mm-action-row" style="margin-top:6px;">
             <button id="mm_new_slot">新建存档</button>
           </div>
-          <label class="checkbox_label" for="mm_auto_save_slot" style="margin-top:6px;">
-            <input id="mm_auto_save_slot" type="checkbox" checked />
-            <span>提取后自动保存到当前存档</span>
-          </label>
-          <small style="opacity:0.6">
-            记忆存档独立于聊天记录，切换聊天/新建聊天时可自动加载同角色的存档。
-            支持多存档槽位（IF线/分支线）。
-          </small>
         </div>
         <hr />
 
@@ -284,6 +308,9 @@
               <div id="mm_page_list" class="mm-memory-list">
                 <div class="mm-empty-state">暂无故事页</div>
               </div>
+              <div class="mm-action-row" style="margin-top:6px">
+                <button id="mm_add_page" title="手动新增故事页">+ 新增故事页</button>
+              </div>
             </div>
           </div>
         </div>
@@ -308,7 +335,9 @@
           <div>待处理消息: <span id="mm_pending_count">0</span></div>
         </div>
 
-        <div class="mm-version">MMPEAv5.3.1金瓜瓜@gua.guagua.uk</div>
+        <div class="mm-version">MMPEAv5.5.9瓜瓜@gua.guagua.uk</div>
+
+        </div><!-- /mm_settings_body -->
 
       </div><!-- /mm_main_content -->
 
