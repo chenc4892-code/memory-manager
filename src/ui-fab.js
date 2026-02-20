@@ -377,22 +377,22 @@ export function renderDirectiveTab() {
             </details>
             <div class="mm-directive-field">
                 <label>全局指令 <small style="opacity:0.6">(所有环节都会附加)</small></label>
-                <textarea id="mm_dir_global" class="text_pole mm-directive-textarea" rows="2"
+                <textarea id="mm_dir_global" class="text_pole mm-directive-textarea" data-key="global" rows="2"
                     placeholder="例如：所有记忆以第三人称记录，保持简洁">${escapeHtml(dir.global || '')}</textarea>
             </div>
             <div class="mm-directive-field">
                 <label>提取指令</label>
-                <textarea id="mm_dir_extraction" class="text_pole mm-directive-textarea" rows="2"
+                <textarea id="mm_dir_extraction" class="text_pole mm-directive-textarea" data-key="extraction" rows="2"
                     placeholder="例如：重点记录角色的情感变化和承诺">${escapeHtml(dir.extraction || '')}</textarea>
             </div>
             <div class="mm-directive-field">
                 <label>召回指令</label>
-                <textarea id="mm_dir_recall" class="text_pole mm-directive-textarea" rows="2"
+                <textarea id="mm_dir_recall" class="text_pole mm-directive-textarea" data-key="recall" rows="2"
                     placeholder="例如：优先召回与当前话题相关的承诺和冲突">${escapeHtml(dir.recall || '')}</textarea>
             </div>
             <div class="mm-directive-field">
                 <label>压缩指令</label>
-                <textarea id="mm_dir_compression" class="text_pole mm-directive-textarea" rows="2"
+                <textarea id="mm_dir_compression" class="text_pole mm-directive-textarea" data-key="compression" rows="2"
                     placeholder="例如：压缩时保留所有角色名和关键日期">${escapeHtml(dir.compression || '')}</textarea>
             </div>
             <div class="mm-directive-actions">
@@ -404,15 +404,24 @@ export function renderDirectiveTab() {
     `;
     container.html(html);
 
-    container.find('.mm-directive-save').on('click', () => {
+    container.find('#mm_dir_save').on('click', () => {
         const data2 = getMemoryData();
         if (!data2.managerDirective) data2.managerDirective = {};
         container.find('.mm-directive-textarea').each(function () {
             const key = $(this).data('key');
-            data2.managerDirective[key] = $(this).val().trim();
+            if (key) data2.managerDirective[key] = $(this).val().trim();
         });
         saveMemoryData();
         toastr?.success?.('指令已保存', 'Memory Manager');
+    });
+
+    container.find('#mm_dir_clear').on('click', () => {
+        if (!confirm('确认清空所有管理指令？')) return;
+        const data2 = getMemoryData();
+        data2.managerDirective = {};
+        saveMemoryData();
+        container.find('.mm-directive-textarea').val('');
+        toastr?.success?.('指令已清空', 'Memory Manager');
     });
 }
 
