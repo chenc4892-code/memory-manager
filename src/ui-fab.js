@@ -753,7 +753,7 @@ export async function quickExtractRange(start, end) {
 
     toastr?.info?.(`正在提取消息 ${start}-${end}...`, 'Memory Manager');
     try {
-        await safeExtract(true);
+        await safeExtract(true, { start, end });
         toastr?.success?.(`消息 ${start}-${end} 提取完成`);
     } catch (err) {
         toastr?.error?.('提取失败: ' + err.message);
@@ -1043,7 +1043,7 @@ export async function performBatchInitialization() {
         setMood('thinking');
         updateInitProgressUI(0, 1, '准备初始化...');
 
-        await forceExtractUnprocessed(data, ctx, s);
+        await forceExtractUnprocessed(data, ctx, s, range);
 
         setMood('joyful', 5000);
         updateBrowserUI();

@@ -338,7 +338,7 @@ export async function performExtraction() {
     await safeCompress(false);
 }
 
-export async function safeExtract(force = false) {
+export async function safeExtract(force = false, range = null) {
     const s = getSettings();
     if (!s.enabled && !force) return;
 
@@ -369,7 +369,7 @@ export async function safeExtract(force = false) {
     }
 
     if (force) {
-        await forceExtractUnprocessed(data, ctx, s);
+        await forceExtractUnprocessed(data, ctx, s, range);
     } else {
         // Normal mode: watermark-based incremental extraction
         const pendingCount = ctx.chat.length - 1 - data.processing.lastExtractedMessageId;
@@ -405,17 +405,21 @@ export async function safeExtract(force = false) {
  * Force extraction: scan ALL chat messages, find unextracted ones by send_date marks,
  * batch them, extract with retry logic.
  */
-export async function forceExtractUnprocessed(data, ctx, s) {
+export async function forceExtractUnprocessed(data, ctx, s, range = null) {
     const dates = data.processing.extractedMsgDates || {};
     const chat = ctx.chat;
 
     // Buffer zone: skip last 4 messages
     const BUFFER = 4;
-    const endIdx = Math.max(0, chat.length - BUFFER);
+    const defaultEnd = Math.max(0, chat.length - BUFFER);
+
+    // Apply user-specified range if provided (range.end is inclusive from dialog)
+    const scanStart = (range && typeof range.start === 'number') ? Math.max(0, range.start) : 0;
+    const endIdx = (range && typeof range.end === 'number') ? Math.min(range.end + 1, defaultEnd) : defaultEnd;
 
     // Find all unextracted messages (including hidden ones — auto-hide sets is_system=true)
     const unextracted = [];
-    for (let i = 0; i < endIdx; i++) {
+    for (let i = scanStart; i < endIdx; i++) {
         const m = chat[i];
         if (!m || !m.mes) continue;
         if (m.send_date && dates[m.send_date]) continue; // already extracted
