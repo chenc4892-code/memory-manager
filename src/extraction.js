@@ -405,13 +405,13 @@ export async function safeExtract(force = false, range = null) {
  * Force extraction: scan ALL chat messages, find unextracted ones by send_date marks,
  * batch them, extract with retry logic.
  */
-export async function forceExtractUnprocessed(data, ctx, s, range = null) {
+export async function forceExtractUnprocessed(data, ctx, s, range = null, options = {}) {
     const dates = data.processing.extractedMsgDates || {};
     const chat = ctx.chat;
 
-    // Buffer zone: skip last 4 messages
-    const BUFFER = 4;
-    const defaultEnd = Math.max(0, chat.length - BUFFER);
+    // Buffer zone: skip last 4 messages (unless noBuffer is set)
+    const BUFFER = options.noBuffer ? 0 : 4;
+    const defaultEnd = options.noBuffer ? chat.length : Math.max(0, chat.length - BUFFER);
 
     // Apply user-specified range if provided (range.end is inclusive from dialog)
     const scanStart = (range && typeof range.start === 'number') ? Math.max(0, range.start) : 0;

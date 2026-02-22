@@ -11,9 +11,9 @@ import {
 } from './constants.js';
 import { warn, escapeHtml } from './utils.js';
 import {
-    getSettings, getMemoryData, saveMemoryData,
+    getSettings, getMemoryData, saveMemoryData, saveMemoryDataImmediate,
 } from './data.js';
-import { callSecondaryApiChat } from './api.js';
+import { callSecondaryApiChat, callLLM } from './api.js';
 import { formatStoryIndex } from './formatting.js';
 import { loadLottieLib, setMood } from './mood.js';
 import {
@@ -26,6 +26,7 @@ import {
 import { updateBrowserUI } from './ui-browser.js';
 
 import { getContext } from '../../../../extensions.js';
+import { hideChatMessageRange } from '../../../../chats.js';
 
 const $ = window.jQuery;
 const toastr = window.toastr;
@@ -397,7 +398,7 @@ export function renderDirectiveTab() {
             </div>
             <div class="mm-directive-actions">
                 <button id="mm_dir_save" class="mm-btn-save-entry">直接保存</button>
-                <button id="mm_dir_organize" class="mm-btn-cancel-entry" title="让LLM帮你整理指令">让管理员整理</button>
+                <button id="mm_dir_organize" class="mm-btn-cancel-entry" title="让LLM帮你写prompt">让管理员帮写prompt</button>
                 <button id="mm_dir_clear" class="mm-btn-cancel-entry" style="color:#ef4444">清空</button>
             </div>
         </div>
@@ -411,7 +412,7 @@ export function renderDirectiveTab() {
             const key = $(this).data('key');
             if (key) data2.managerDirective[key] = $(this).val().trim();
         });
-        saveMemoryData();
+        saveMemoryDataImmediate();
         toastr?.success?.('指令已保存', 'Memory Manager');
     });
 
@@ -419,9 +420,60 @@ export function renderDirectiveTab() {
         if (!confirm('确认清空所有管理指令？')) return;
         const data2 = getMemoryData();
         data2.managerDirective = {};
-        saveMemoryData();
+        saveMemoryDataImmediate();
         container.find('.mm-directive-textarea').val('');
         toastr?.success?.('指令已清空', 'Memory Manager');
+    });
+
+    container.find('#mm_dir_organize').on('click', async () => {
+        const globalDir = container.find('#mm_dir_global').val().trim();
+        const extractionDir = container.find('#mm_dir_extraction').val().trim();
+        const recallDir = container.find('#mm_dir_recall').val().trim();
+        const compressionDir = container.find('#mm_dir_compression').val().trim();
+
+        const allText = [globalDir, extractionDir, recallDir, compressionDir].filter(Boolean).join('\n');
+        const data2 = getMemoryData();
+        const memoryContext = `当前有 ${data2.pages.length} 个故事页，${data2.characters.length} 个NPC，时间线${data2.timeline ? '已有' : '空'}`;
+
+        const btn = container.find('#mm_dir_organize');
+        btn.prop('disabled', true).text('生成中...');
+
+        try {
+            let userPrompt;
+            if (allText) {
+                userPrompt = `用户已写了一些管理指令：\n${allText}\n\n请帮助整理和完善这些指令，分配到合适的环节。记忆系统概况：${memoryContext}\n\n请输出JSON：{"global":"...","extraction":"...","recall":"...","compression":"..."}\n每个环节的指令应该简洁明确（每项不超过50字），如果某项不需要特别要求则留空字符串。`;
+            } else {
+                userPrompt = `用户还没有写管理指令。请根据以下记忆系统概况，生成合理的默认管理指令建议：\n${memoryContext}\n\n记忆管理系统有三个环节：\n- 提取：从聊天中提取故事事件、角色信息\n- 召回：根据当前对话回忆相关记忆\n- 压缩：压缩旧记忆为摘要\n\n请输出JSON：{"global":"...","extraction":"...","recall":"...","compression":"..."}\n每个环节给出简洁实用的默认指令建议（每项不超过50字），全局指令可以为空。`;
+            }
+
+            const response = await callLLM(
+                '你是记忆管理系统的配置助手。严格按要求输出JSON。',
+                userPrompt,
+                500,
+            );
+
+            let organized;
+            try {
+                const jsonMatch = response.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                    organized = JSON.parse(jsonMatch[0]);
+                }
+            } catch (_) { /* parse failed */ }
+
+            if (organized) {
+                if (organized.global !== undefined) container.find('#mm_dir_global').val(organized.global);
+                if (organized.extraction !== undefined) container.find('#mm_dir_extraction').val(organized.extraction);
+                if (organized.recall !== undefined) container.find('#mm_dir_recall').val(organized.recall);
+                if (organized.compression !== undefined) container.find('#mm_dir_compression').val(organized.compression);
+                toastr?.success?.('指令已生成，请检查后点击"直接保存"', 'Memory Manager');
+            } else {
+                toastr?.warning?.('生成结果解析失败，请手动编写', 'Memory Manager');
+            }
+        } catch (err) {
+            toastr?.error?.('生成失败: ' + err.message, 'Memory Manager');
+        } finally {
+            btn.prop('disabled', false).text('让管理员帮写prompt');
+        }
     });
 }
 
@@ -459,6 +511,10 @@ export function renderToolboxTab() {
                 </div>
                 <div class="mm-toolbox-row">
                     <button class="mm-toolbox-btn mm-sync-watermark-btn">同步待处理计数</button>
+                </div>
+                <div class="mm-toolbox-row">
+                    <button class="mm-toolbox-btn mm-archive-all-btn" style="background:#dc2626;color:white;font-weight:600">一键归档全部</button>
+                    <button class="mm-toolbox-btn mm-hide-all-btn" style="background:#6b7280;color:white;font-weight:600">隐藏全部楼层</button>
                 </div>
             </div>
 
@@ -594,6 +650,72 @@ export function renderToolboxTab() {
         saveMemoryData();
         updateBrowserUI(['status']);
         toastr?.success?.(`水位线已同步：${oldWatermark} → ${highestIdx}`, 'Memory Manager');
+    });
+
+    // Archive all (extract including N-2 buffer)
+    container.find('.mm-archive-all-btn').on('click', async () => {
+        const ctx = getContext();
+        if (!ctx.chat || ctx.chat.length === 0) {
+            toastr?.warning?.('当前没有聊天消息', 'Memory Manager');
+            return;
+        }
+
+        const s = getSettings();
+        const buffer = s.autoHide && s.keepRecentMessages >= 3 ? Math.max(0, s.keepRecentMessages - 2) : 4;
+        const pendingData = getMemoryData();
+        const dates = pendingData.processing.extractedMsgDates || {};
+        const unextractedCount = ctx.chat.filter((m, i) => {
+            if (!m || !m.mes || m.is_system) return false;
+            if (m.send_date && dates[m.send_date]) return false;
+            return i >= ctx.chat.length - buffer;
+        }).length;
+
+        if (unextractedCount === 0) {
+            toastr?.info?.('缓冲区内没有待提取的消息', 'Memory Manager');
+            return;
+        }
+
+        if (!confirm(`将提取缓冲区内 ${unextractedCount} 条未提取消息（含最近N-2的内容）。\n此操作会把通常跳过的最近消息也提取为记忆。\n确认继续？`)) return;
+
+        const btn = container.find('.mm-archive-all-btn');
+        btn.prop('disabled', true).text('归档中...');
+
+        try {
+            const data = getMemoryData();
+            await forceExtractUnprocessed(data, ctx, s, null, { noBuffer: true });
+            updateBrowserUI();
+            toastr?.success?.('全部消息已归档（含缓冲区）', 'Memory Manager');
+        } catch (err) {
+            warn('Archive all failed:', err);
+            toastr?.error?.('归档失败: ' + err.message, 'Memory Manager');
+        } finally {
+            btn.prop('disabled', false).text('一键归档全部');
+        }
+    });
+
+    // Hide all messages
+    container.find('.mm-hide-all-btn').on('click', async () => {
+        const ctx = getContext();
+        if (!ctx.chat || ctx.chat.length === 0) {
+            toastr?.warning?.('当前没有聊天消息', 'Memory Manager');
+            return;
+        }
+
+        if (!confirm('将隐藏所有聊天楼层。\n隐藏后可以继续对话，记忆系统照常工作。\n确认继续？')) return;
+
+        const btn = container.find('.mm-hide-all-btn');
+        btn.prop('disabled', true).text('隐藏中...');
+
+        try {
+            const chatLen = ctx.chat.length;
+            await hideChatMessageRange(0, chatLen - 1, false);
+            toastr?.success?.('全部楼层已隐藏', 'Memory Manager');
+        } catch (err) {
+            warn('Hide all failed:', err);
+            toastr?.error?.('隐藏失败: ' + err.message, 'Memory Manager');
+        } finally {
+            btn.prop('disabled', false).text('隐藏全部楼层');
+        }
     });
 
     // Real-time command

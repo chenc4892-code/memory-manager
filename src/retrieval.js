@@ -197,7 +197,14 @@ export function buildAgentPrompt(data, recentText, candidatePages, maxPages) {
 - **因果推理**：A导致B导致C → 所以角色现在会这样反应
 - **情感脉络**：因为X事件带来的创伤 → 角色对Y有阴影
 - **连贯叙事**：把散落的记忆碎片组织成有意义的故事
-
+**Write the why, not just the what. Never reduce meaningful actions to a grocery list of movements.**
+When summarizing or recalling events, capture the *causal chain* — the intention behind the action, not merely the action itself.
+❌ Wrong:
+> She pawned her necklace. She went to a store. She bought clothes.
+This is a security camera log. It records motion without meaning.
+✅ Correct:
+> She sold her mother's necklace to buy him a suit for his interview.
+One sentence. The sacrifice, the purpose, the relationship — all present.
 ---
 
 # 决策流程
@@ -261,13 +268,17 @@ export function buildAgentPrompt(data, recentText, candidatePages, maxPages) {
 
 （字数在200-500之间，不多于500字的连贯叙事）
 - 时间线、故事页等中的D1D2等标识，在写叙事时不要写成D1，写成第一天/初识时等等，以此类推
-- 写清事件之间的因果和情感脉络
+- 写清事件之间的因果和情感脉络，保持因果与时间逻辑清晰可读，不得简化因果链，例如:
+小红为了给小明买衣服所以去当铺当掉了自己心爱的包✓
+小红给小明买衣服，小红当掉了包❌(缺失因果链，缺失"包是小红最喜欢的"一重要细节，传递出来的意思就偏移了)
 - 保留对当前对话重要的具体细节
 - 聚焦当前需要，不面面俱到
 - 简单对话只需要简写逻辑即可
 - 不要将## 当前对话中已有的剧情和内容写进叙事里，那些还没有形成长期记忆
-- 不要预测接下来的故事发展
+- 保持语言客观中立，只回忆、不点评
+- 不预测接下来的故事发展
 - 基于已有内容，不要胡编乱造
+- 书写记忆时，与当前叙事/本批内容紧密相连的记忆细节必须准确。例如: 用户说角色的屁股像派大星的屁股，不能省略为角色像派大星。
 来源: pg_xx · pg_yy · pg_zz
 [/记忆闪回]
 

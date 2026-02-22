@@ -290,11 +290,24 @@ export function getMemoryData() {
     if (!d.processing.extractedMsgDates) {
         d.processing.extractedMsgDates = {};
     }
+    if (!d.managerDirective || typeof d.managerDirective !== 'object') {
+        d.managerDirective = { global: '', extraction: '', recall: '', compression: '' };
+    }
     return d;
 }
 
 export function saveMemoryData() {
     saveMetadataDebounced();
+}
+
+/** Immediate save — flushes the debounced metadata save if possible. */
+export function saveMemoryDataImmediate() {
+    saveMetadataDebounced();
+    try {
+        if (typeof saveMetadataDebounced.flush === 'function') {
+            saveMetadataDebounced.flush();
+        }
+    } catch (_) { /* flush not available */ }
 }
 
 // ── Character / Save Helpers ──

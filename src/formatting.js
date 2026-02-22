@@ -148,14 +148,15 @@ export function buildExtractionPrompt(data, newMessages) {
 
     return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。
 ## 任务
+全局要求：
+- 语言简洁客观，理清剧情脉络与事件起因经过结果，梗概清晰
+- 不得跳过事件原因直接写事件结果，不得胡编乱造。
 
 ### 1. 更新时间线
 基于现有时间线和新消息，输出更新后的完整时间线。
 格式规则:
-- 每行格式 "D{天数}: 短句"，每行不超过30字
-- 旧事件合并为 "D{起}-D{止}: 一句话概括"，不超过30字
-- 像书的目录一样简洁，只写关键转折
-- 保留旧条目的核心信息（大幅压缩措辞）
+- 每行格式 "D{天数}: 短句"，每行不超过30字，像书的目录一样简洁，只写关键转折
+- 旧事件合并为 "D{起}-D{止}: 一句话概括"，不超过30字，保留旧条目的核心信息（大幅压缩措辞）
 - 按时间线排列，控制在15行以内
 - 示例: "D1: 纽约初遇，自由女神像约会" "D2-D4: 共同调查失踪案，发现线索"
 
@@ -164,7 +165,7 @@ export function buildExtractionPrompt(data, newMessages) {
 
 **已知角色**（${knownCharNamesStr}）— 只更新态度：
   输出到 knownCharacterAttitudes 数组，每项: {name, attitude}
-  attitude: 该角色对主角（${userName}）的态度/关系变化轨迹
+  attitude: 该角色对主角（${userName}）的态度/关系变化轨迹，言简意赅
 
 **新NPC角色**（不含主角"${userName}"、不含已知角色）：
   输出到 newCharacters 数组，每项: {name, role, appearance, personality, attitude, keywords}
@@ -173,12 +174,13 @@ export function buildExtractionPrompt(data, newMessages) {
   仅收录剧情中新登场的、非已知角色列表中的NPC
 
 ### 3. 更新重要物品
-更新物品名+位置+持有人+简述，仅为**有重要意义、会在后续剧情产生影响的物品**建立档案，不记录可乐薯片等消耗品
+更新物品名+位置+持有人+简述。
+仅为**有重要意义、会在后续剧情产生影响的物品**建立档案，不记录可乐薯片等消耗品
 每个物品: name, status, significance
 
 ### 4. 提取故事页（Story Pages）
 从消息中提取值得记录的事件。每个页面是一个完整事件的因果记录。
-不仅限于重大转折，任何改变事件走向、揭示关键信息、推动关系变化的事件都应记录。
+任何改变事件走向、揭示关键信息、推动关系变化的事件都应记录。
 日常噪音（补妆、移动、整理仪容等不影响剧情的动作）不记录。
 
 每个页面包含:
@@ -188,13 +190,14 @@ export function buildExtractionPrompt(data, newMessages) {
 - content: 以事件为单位，记录因果链（50-150字）。规则：
   · 写"为什么"而非仅写"做了什么"（因果关系优先）
     ❌ "她典当了项链，去买了衣服"
-    ✅ "她卖掉母亲留下的项链，换钱为他买面试穿的西装"
+    ✅ "她卖掉母亲留下的项链，为了换钱给他买面试穿的西装"
+    One sentence. The sacrifice, the purpose, the relationship — all present.
   · 按事件组织，不按分钟组织。一个事件=起因→经过→结果
     ❌ "08:14 A摔门 → 08:17 A哭泣 → 08:22 A喊哥哥"
     ✅ "[清晨] A说出全名后情绪崩溃离开，B追出安抚，C目睹后放弃审讯姿态"
-  · 可记录1-2句决定事件走向的关键对话（用概括语言，禁止大段引用原文台词）
+  · 可记录1-2句决定事件走向的关键对话，允许引用原台词
   · 使用时间段（清晨/上午/下午/傍晚/深夜），禁止精确到分钟
-  · 不要文学修饰和感官细节渲染
+  · 去掉文学修饰和感官细节渲染
 - keywords: 用于检索的关键词数组（3-8个，含角色名、地点、物品、情感关键词）
 - categories: 语义分类标签数组，从以下选择1-3个:
     "emotional"(情感事件), "relationship"(关系变化),
@@ -256,7 +259,7 @@ ${newMessages}
 
 注意：
 - 只输出JSON代码块，不要有其他文字
-- 角色名使用实际名字，不用{{char}}或{{user}}
+- 角色名使用实际名字
 - knownCharacterAttitudes 只含已知角色（${knownCharNamesStr}）
 - newCharacters 不含主角"${userName}"和已知角色
 - items要输出完整列表（含未变化的旧条目）
