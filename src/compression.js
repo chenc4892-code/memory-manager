@@ -20,7 +20,7 @@ const toastr = window.toastr;
 export function buildPageCompressionPrompt(page) {
     return `[OOC: 将以下故事事件压缩为30-50字的精炼摘要。保留：谁、做了什么、为什么、结果如何。去除感官细节和修辞。
 
-原文 (${page.day} - ${page.title}):
+原文 (${page.date || '?'} - ${page.title}):
 ${page.content}
 
 要求:

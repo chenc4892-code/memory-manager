@@ -39,7 +39,7 @@ export function registerSlashCommands() {
                 const narrative = getLastNarrative();
                 if (!narrative) return '当前没有记忆召回';
                 const pages = getLastRecalledPages();
-                const sources = pages.map(p => `${p.day} ${p.title}`).join(', ');
+                const sources = pages.map(p => `${p.date || '?'} ${p.title}`).join(', ');
                 return narrative + (sources ? `\n\n来源: ${sources}` : '');
             },
             helpString: '显示当前记忆召回叙事',
@@ -61,7 +61,7 @@ export function registerSlashCommands() {
                 if (data.pages.length === 0) return '没有故事页';
                 return data.pages.map(p => {
                     const level = ['详细', '摘要', '归档'][p.compressionLevel] || '?';
-                    return `[${p.day}] ${p.title} (${p.significance}, ${level}) keywords: ${(p.keywords || []).join(',')}`;
+                    return `[${p.date || '?'}] ${p.title} (${p.significance}, ${level}) keywords: ${(p.keywords || []).join(',')}`;
                 }).join('\n');
             },
             helpString: '列出所有故事页',

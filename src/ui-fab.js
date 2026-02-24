@@ -322,7 +322,7 @@ export function updateRecallPanel() {
             const preview = (p.content || '').substring(0, 120) + ((p.content || '').length > 120 ? '...' : '');
             html += `<div class="mm-recall-panel-page">
                 <div class="mm-recall-panel-page-header">
-                    <span class="mm-recall-panel-page-day">${escapeHtml(p.day || '?')}</span>
+                    <span class="mm-recall-panel-page-day">${escapeHtml(p.date || '?')}</span>
                     <span class="mm-recall-panel-page-title">${escapeHtml(p.title)}</span>
                     ${catTags}
                 </div>
@@ -510,9 +510,6 @@ export function renderToolboxTab() {
                     <button class="mm-toolbox-btn mm-rebuild-vectors-btn">重建向量库</button>
                 </div>
                 <div class="mm-toolbox-row">
-                    <button class="mm-toolbox-btn mm-sync-watermark-btn">同步待处理计数</button>
-                </div>
-                <div class="mm-toolbox-row">
                     <button class="mm-toolbox-btn mm-archive-all-btn" style="background:#dc2626;color:white;font-weight:600">一键归档全部</button>
                     <button class="mm-toolbox-btn mm-hide-all-btn" style="background:#6b7280;color:white;font-weight:600">隐藏全部楼层</button>
                 </div>
@@ -621,35 +618,6 @@ export function renderToolboxTab() {
         } else {
             toastr?.warning?.('请先在设置面板中配置向量相关参数');
         }
-    });
-
-    // Sync watermark to extractedMsgDates
-    container.find('.mm-sync-watermark-btn').on('click', () => {
-        const data = getMemoryData();
-        const ctx = getContext();
-        const extracted = data.processing.extractedMsgDates || {};
-        const chat = ctx.chat || [];
-
-        // Find the highest chat index whose send_date is marked as extracted
-        let highestIdx = -1;
-        for (let i = chat.length - 1; i >= 0; i--) {
-            const msg = chat[i];
-            if (msg?.send_date && extracted[msg.send_date]) {
-                highestIdx = i;
-                break;
-            }
-        }
-
-        const oldWatermark = data.processing.lastExtractedMessageId ?? -1;
-        if (highestIdx <= oldWatermark) {
-            toastr?.info?.(`水位线已是最新（${oldWatermark}），无需同步`, 'Memory Manager');
-            return;
-        }
-
-        data.processing.lastExtractedMessageId = highestIdx;
-        saveMemoryData();
-        updateBrowserUI(['status']);
-        toastr?.success?.(`水位线已同步：${oldWatermark} → ${highestIdx}`, 'Memory Manager');
     });
 
     // Archive all (extract including N-2 buffer)
@@ -839,7 +807,7 @@ export function runHealthCheck() {
             html += `
                 <label class="mm-health-orphan-item">
                     <input type="checkbox" class="mm-orphan-check" data-page-id="${p.id}" ${checked} />
-                    <span class="mm-orphan-day">${escapeHtml(p.day || '?')}</span>
+                    <span class="mm-orphan-day">${escapeHtml(p.date || '?')}</span>
                     <span class="mm-orphan-title">${escapeHtml(p.title)}</span>
                     ${statusLabel}
                 </label>`;
@@ -975,16 +943,16 @@ export function executeRealTimeTool(name, args, data) {
             || p.content.toLowerCase().includes(kw),
         );
         if (matched.length === 0) return `没有找到关键词"${args.keyword}"相关的页面。`;
-        return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+        return matched.map(p => `[${p.id}] ${p.date || '?'} | ${p.title}`).join('\n');
     }
     case 'read_page': {
         const page = data.pages.find(p => p.id === args.page_id);
         if (!page) return `页面 ${args.page_id} 不存在。`;
-        return `[${page.id}] ${page.day} | ${page.title}\n${page.content}`;
+        return `[${page.id}] ${page.date || '?'} | ${page.title}\n${page.content}`;
     }
     case 'list_pages':
         if (pages.length === 0) return '没有故事页。';
-        return pages.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+        return pages.map(p => `[${p.id}] ${p.date || '?'} | ${p.title}`).join('\n');
     case 'show_timeline':
         return data.timeline || '（时间线为空）';
     case 'show_characters': {
@@ -1080,12 +1048,7 @@ export function showInitRangeDialog() {
     return new Promise((resolve) => {
         const ctx = getContext();
         const chatLen = ctx.chat ? ctx.chat.length : 0;
-
-        if (chatLen === 0) {
-            toastr?.warning?.('当前没有聊天消息');
-            resolve(null);
-            return;
-        }
+        const maxIdx = Math.max(0, chatLen - 1);
 
         // Remove any existing dialog
         $('#mm_init_dialog').remove();
@@ -1098,15 +1061,19 @@ export function showInitRangeDialog() {
                     <div class="mm-init-dialog-range">
                         <div class="mm-init-dialog-field">
                             <label>起始</label>
-                            <input type="number" class="mm-init-start text_pole" value="0" min="0" max="${chatLen - 1}" />
+                            <input type="number" class="mm-init-start text_pole" value="0" min="0" max="${maxIdx}" />
                         </div>
                         <span class="mm-init-dialog-sep">—</span>
                         <div class="mm-init-dialog-field">
                             <label>结束</label>
-                            <input type="number" class="mm-init-end text_pole" value="${chatLen - 1}" min="0" max="${chatLen - 1}" />
+                            <input type="number" class="mm-init-end text_pole" value="${maxIdx}" min="0" max="${maxIdx}" />
                         </div>
                     </div>
-                    <div class="mm-init-dialog-hint">留空或 0 — ${chatLen - 1} 表示处理全部消息</div>
+                    <label class="mm-init-dialog-option" style="display:flex;align-items:center;gap:6px;margin:6px 0">
+                        <input type="checkbox" class="mm-init-worldbook" checked />
+                        <span>包含世界书/角色卡内容</span>
+                    </label>
+                    <div class="mm-init-dialog-hint">${chatLen > 0 ? `留空或 0 — ${maxIdx} 表示处理全部消息` : '勾选上方选项可仅从世界书提取记忆'}</div>
                     <div class="mm-init-dialog-actions">
                         <button class="mm-toolbox-btn mm-init-cancel">取消</button>
                         <button class="mm-toolbox-btn mm-toolbox-btn-send mm-init-confirm">开始初始化</button>
@@ -1130,14 +1097,15 @@ export function showInitRangeDialog() {
 
         dialog.find('.mm-init-confirm').on('click', () => {
             const start = parseInt(dialog.find('.mm-init-start').val()) || 0;
-            const end = Math.min(parseInt(dialog.find('.mm-init-end').val()) || chatLen - 1, chatLen - 1);
+            const end = Math.min(parseInt(dialog.find('.mm-init-end').val()) || maxIdx, maxIdx);
+            const includeWorldBook = dialog.find('.mm-init-worldbook').prop('checked');
             dialog.remove();
-            if (start > end) {
+            if (chatLen > 0 && start > end) {
                 toastr?.warning?.('起始不能大于结束');
                 resolve(null);
                 return;
             }
-            resolve({ start, end });
+            resolve({ start, end, includeWorldBook });
         });
 
         $('body').append(dialog);
@@ -1165,7 +1133,10 @@ export async function performBatchInitialization() {
         setMood('thinking');
         updateInitProgressUI(0, 1, '准备初始化...');
 
-        await forceExtractUnprocessed(data, ctx, s, range);
+        const options = {};
+        if (range.includeWorldBook) options.includeWorldBook = true;
+
+        await forceExtractUnprocessed(data, ctx, s, range, options);
 
         setMood('joyful', 5000);
         updateBrowserUI();

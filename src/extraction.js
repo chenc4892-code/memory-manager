@@ -16,7 +16,7 @@ import {
     getMemoryData, saveMemoryData, getSettings,
     getKnownCharacterNames,
 } from './data.js';
-import { callLLM } from './api.js';
+import { callLLM, gatherWorldBookContext } from './api.js';
 import { buildExtractionPrompt, mergeTimelines } from './formatting.js';
 import { setMood } from './mood.js';
 import { isEmbeddingConfigured, embedPage, embedCharacter } from './embedding.js';
@@ -52,6 +52,22 @@ export function resetConsecutiveFailures() {
 
 // ── Core Functions ──
 
+/**
+ * 从聊天尾部向前扫描，找到最近一条已提取消息的索引。
+ * 常规场景下只需扫描几条即可返回，O(1) 摊销复杂度。
+ * @param {Array} chat - ctx.chat 数组
+ * @param {Object} dates - data.processing.extractedMsgDates 字典
+ * @returns {number} 最近已提取消息的索引，无则返回 -1
+ */
+export function getHighestExtractedIndex(chat, dates) {
+    if (!chat || !dates) return -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const msg = chat[i];
+        if (msg?.send_date && dates[msg.send_date]) return i;
+    }
+    return -1;
+}
+
 export function applyExtractionResult(data, result, sourceDates = []) {
     // Update timeline (merge to prevent data loss from weak LLM outputs)
     if (result.timeline) {
@@ -74,10 +90,12 @@ export function applyExtractionResult(data, result, sourceDates = []) {
             );
             if (existing) {
                 if (incoming.attitude) existing.attitude = incoming.attitude;
+                if (incoming.metDate && !existing.metDate) existing.metDate = incoming.metDate;
             } else {
                 data.knownCharacterAttitudes.push({
                     name: incoming.name.trim(),
                     attitude: incoming.attitude || '',
+                    metDate: incoming.metDate || '',
                 });
             }
         }
@@ -98,6 +116,7 @@ export function applyExtractionResult(data, result, sourceDates = []) {
                 personality: c.personality || '',
                 attitude: c.attitude || '',
                 keywords: Array.isArray(c.keywords) ? c.keywords : [],
+                metDate: c.metDate || '',
             };
             if (existingIdx >= 0) {
                 // Merge: only overwrite non-empty fields
@@ -105,6 +124,7 @@ export function applyExtractionResult(data, result, sourceDates = []) {
                 if (charData.appearance) data.characters[existingIdx].appearance = charData.appearance;
                 if (charData.personality) data.characters[existingIdx].personality = charData.personality;
                 if (charData.attitude) data.characters[existingIdx].attitude = charData.attitude;
+                if (charData.metDate && !data.characters[existingIdx].metDate) data.characters[existingIdx].metDate = charData.metDate;
                 if (charData.keywords.length > 0) {
                     // Merge keywords: preserve existing, add new ones
                     const existingKws = new Set(data.characters[existingIdx].keywords || []);
@@ -196,7 +216,6 @@ export function applyExtractionResult(data, result, sourceDates = []) {
             const newId = generateId('pg');
             data.pages.push({
                 id: newId,
-                day: page.day || '',
                 date: page.date || '',
                 title: page.title,
                 content: page.content,
@@ -227,16 +246,17 @@ export function markMsgsExtracted(data, messages) {
 }
 
 /**
- * Perform incremental extraction based on watermark.
+ * Perform incremental extraction based on extractedMsgDates.
  * NOTE: Does NOT call updateBrowserUI(). Caller (safeExtract) handles post-extraction flow.
  */
 export async function performExtraction() {
     const ctx = getContext();
     const data = getMemoryData();
-    const lastId = data.processing.lastExtractedMessageId;
+    const chat = ctx.chat;
+    const dates = data.processing.extractedMsgDates || {};
+    const lastId = getHighestExtractedIndex(chat, dates);
 
     const startIdx = Math.max(0, lastId + 1);
-    const chat = ctx.chat;
     if (startIdx >= chat.length) return;
 
     // Buffer zone: skip recent N-2 messages to avoid extracting content user might re-roll
@@ -275,7 +295,6 @@ export async function performExtraction() {
 
         applyExtractionResult(data, result, pendingMsgs.filter(m => m.send_date).map(m => m.send_date));
         markMsgsExtracted(data, pendingMsgs);
-        data.processing.lastExtractedMessageId = endIdx - 1;
         saveMemoryData();
     } else {
         // Multi-batch extraction for large backlogs
@@ -318,7 +337,6 @@ export async function performExtraction() {
 
             applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
             markMsgsExtracted(data, batch.map(item => item.msg));
-            data.processing.lastExtractedMessageId = batchLastIdx;
             saveMemoryData();
             log(`Batch ${bi + 1}/${batches.length} done. Pages: ${data.pages.length}`);
         }
@@ -371,8 +389,10 @@ export async function safeExtract(force = false, range = null) {
     if (force) {
         await forceExtractUnprocessed(data, ctx, s, range);
     } else {
-        // Normal mode: watermark-based incremental extraction
-        const pendingCount = ctx.chat.length - 1 - data.processing.lastExtractedMessageId;
+        // Normal mode: date-mark-based incremental extraction
+        const dates = data.processing.extractedMsgDates || {};
+        const highestIdx = getHighestExtractedIndex(ctx.chat, dates);
+        const pendingCount = ctx.chat.length - 1 - highestIdx;
         if (pendingCount < s.extractionInterval) return;
 
         data.processing.extractionInProgress = true;
@@ -402,12 +422,81 @@ export async function safeExtract(force = false, range = null) {
 }
 
 /**
+ * World-book-only extraction: no chat messages, just extract from world book content.
+ * Used when initializing a new chat with world book data.
+ */
+async function _worldBookOnlyExtraction(data, s) {
+    let worldBookContext = '';
+    try {
+        worldBookContext = await gatherWorldBookContext();
+    } catch (err) {
+        warn('Failed to gather world book context:', err);
+    }
+
+    if (!worldBookContext) {
+        toastr?.info?.('没有未提取的消息，世界书也为空', 'Memory Manager');
+        _ui.updateStatusDisplay?.();
+        return;
+    }
+
+    data.processing.extractionInProgress = true;
+    saveMemoryData();
+    setMood('thinking');
+
+    const initMaxTokens = Math.max(s.extractionMaxTokens, 8192);
+    toastr?.info?.('从世界书/角色卡提取记忆...', 'Memory Manager', { timeOut: 5000 });
+    _ui.updateInitProgressUI?.(0, 1, '正在从世界书提取记忆...');
+
+    try {
+        const prompt = buildExtractionPrompt(data, '（无聊天消息，请仅从下方世界书内容提取角色、物品、背景设定等信息）', worldBookContext);
+        const response = await callLLM(
+            '你是剧情记忆管理系统。严格按要求输出JSON。',
+            prompt,
+            initMaxTokens,
+        );
+
+        const result = parseJsonResponse(response);
+        if (!result) {
+            throw new Error('世界书提取结果解析失败');
+        }
+
+        applyExtractionResult(data, result, []);
+        saveMemoryData();
+
+        _ui.updateInitProgressUI?.(1, 1, '世界书提取完成！');
+        setMood('joyful', 5000);
+        toastr?.success?.(
+            `世界书提取完成！当前共 ${data.pages.length} 个故事页`,
+            'Memory Manager', { timeOut: 8000 },
+        );
+
+        // Post-extraction tasks
+        if (isEmbeddingConfigured()) {
+            const newPages = data.pages.filter(p => !data.embeddings[p.id] && p.compressionLevel <= COMPRESS_SUMMARY);
+            for (const page of newPages) {
+                await embedPage(page);
+            }
+        }
+        await safeCompress(false);
+        _ui.updateBrowserUI?.();
+    } catch (err) {
+        warn('World book extraction failed:', err);
+        setMood('sad', 5000);
+        toastr?.error?.('世界书提取失败: ' + err.message, 'Memory Manager');
+    } finally {
+        data.processing.extractionInProgress = false;
+        saveMemoryData();
+        _ui.updateStatusDisplay?.();
+    }
+}
+
+/**
  * Force extraction: scan ALL chat messages, find unextracted ones by send_date marks,
  * batch them, extract with retry logic.
  */
 export async function forceExtractUnprocessed(data, ctx, s, range = null, options = {}) {
     const dates = data.processing.extractedMsgDates || {};
-    const chat = ctx.chat;
+    const chat = ctx.chat || [];
 
     // Buffer zone: skip last 4 messages (unless noBuffer is set)
     const BUFFER = options.noBuffer ? 0 : 4;
@@ -426,11 +515,10 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
         unextracted.push({ msg: m, idx: i });
     }
 
+    // No unextracted messages — but if world book requested, try world-book-only extraction
     if (unextracted.length === 0) {
-        // All messages are already marked — sync the watermark to avoid phantom pending count
-        if (endIdx - 1 > data.processing.lastExtractedMessageId) {
-            data.processing.lastExtractedMessageId = endIdx - 1;
-            saveMemoryData();
+        if (options.includeWorldBook) {
+            return await _worldBookOnlyExtraction(data, s);
         }
         toastr?.info?.('所有消息均已提取，没有需要处理的内容', 'Memory Manager');
         _ui.updateStatusDisplay?.();
@@ -440,6 +528,19 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
     data.processing.extractionInProgress = true;
     saveMemoryData();
     setMood('thinking');
+
+    // Gather world book context if requested (used during initialization)
+    let worldBookContext = '';
+    if (options.includeWorldBook) {
+        try {
+            worldBookContext = await gatherWorldBookContext();
+            if (worldBookContext) {
+                log('World book context gathered:', worldBookContext.length, 'chars');
+            }
+        } catch (err) {
+            warn('Failed to gather world book context:', err);
+        }
+    }
 
     const BATCH_SIZE = 20;
     const batches = [];
@@ -464,7 +565,7 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
             _ui.updateInitProgressUI?.(bi, totalBatches, `正在等待第 ${bi + 1}/${totalBatches} 批 API 响应...`);
 
             try {
-                const prompt = buildExtractionPrompt(data, batchText);
+                const prompt = buildExtractionPrompt(data, batchText, worldBookContext);
                 const response = await callLLM(
                     '你是剧情记忆管理系统。严格按要求输出JSON。',
                     prompt,
@@ -481,11 +582,6 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
 
                 applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
                 markMsgsExtracted(data, batch.map(item => item.msg));
-
-                // Advance watermark if applicable
-                if (batchLastIdx > data.processing.lastExtractedMessageId) {
-                    data.processing.lastExtractedMessageId = batchLastIdx;
-                }
 
                 saveMemoryData();
                 successCount++;
@@ -512,7 +608,7 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
                 _ui.updateInitProgressUI?.(ri, retryList.length, `重试第 ${ri + 1}/${retryList.length} 批，等待API响应...`);
 
                 try {
-                    const prompt = buildExtractionPrompt(data, batchText);
+                    const prompt = buildExtractionPrompt(data, batchText, worldBookContext);
                     const response = await callLLM(
                         '你是剧情记忆管理系统。严格按要求输出JSON。',
                         prompt,
@@ -528,10 +624,6 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
 
                     applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
                     markMsgsExtracted(data, batch.map(item => item.msg));
-
-                    if (batchLastIdx > data.processing.lastExtractedMessageId) {
-                        data.processing.lastExtractedMessageId = batchLastIdx;
-                    }
 
                     saveMemoryData();
                     successCount++;
@@ -592,7 +684,8 @@ export async function hideProcessedMessages() {
 
     const ctx = getContext();
     const data = getMemoryData();
-    const lastExtracted = data.processing.lastExtractedMessageId;
+    const dates = data.processing.extractedMsgDates || {};
+    const lastExtracted = getHighestExtractedIndex(ctx.chat, dates);
     if (lastExtracted < 0) return;
 
     const chatLen = ctx.chat.length;

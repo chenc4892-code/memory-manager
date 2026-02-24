@@ -79,10 +79,10 @@ export function buildAgentTools(data) {
       parameters: {
         type: 'object',
         properties: {
-          d1: { type: 'string', description: '起始天数，如 "D3"' },
-          d2: { type: 'string', description: '结束天数，如 "D7"' },
+          start_date: { type: 'string', description: '起始日期，如 "2025-01-01"' },
+          end_date: { type: 'string', description: '结束日期，如 "2025-01-07"' },
         },
-        required: ['d1', 'd2'],
+        required: ['start_date', 'end_date'],
       },
     },
   });
@@ -131,17 +131,17 @@ export function executeAgentTool(toolName, args, data) {
       const cat = args.category;
       const matched = pages.filter(p => Array.isArray(p.categories) && p.categories.includes(cat));
       if (matched.length === 0) return `没有找到分类为"${MEMORY_CATEGORIES[cat] || cat}"的页面。`;
-      return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+      return matched.map(p => `[${p.id}] ${p.date || '?'} | ${p.title}`).join('\n');
     }
     case 'search_by_timerange': {
-      const d1 = parseInt((args.d1 || '').replace(/\D/g, '')) || 0;
-      const d2 = parseInt((args.d2 || '').replace(/\D/g, '')) || 9999;
+      const start = args.start_date || '0000-00-00';
+      const end = args.end_date || '9999-99-99';
       const matched = pages.filter(p => {
-        const d = parseInt((p.day || '').replace(/\D/g, '')) || 0;
-        return d >= d1 && d <= d2;
+        const d = p.date || '';
+        return d >= start && d <= end;
       });
-      if (matched.length === 0) return `D${d1}-D${d2}之间没有找到页面。`;
-      return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+      if (matched.length === 0) return `${start}~${end}之间没有找到页面。`;
+      return matched.map(p => `[${p.id}] ${p.date || '?'} | ${p.title}`).join('\n');
     }
     case 'search_by_keyword': {
       const kw = (args.keyword || '').toLowerCase();
@@ -149,13 +149,13 @@ export function executeAgentTool(toolName, args, data) {
         (p.keywords || []).some(k => k.toLowerCase().includes(kw)) || p.title.toLowerCase().includes(kw),
       );
       if (matched.length === 0) return `没有找到关键词"${args.keyword}"相关的页面。`;
-      return matched.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n');
+      return matched.map(p => `[${p.id}] ${p.date || '?'} | ${p.title}`).join('\n');
     }
     case 'read_story_page': {
       const page = data.pages.find(p => p.id === args.page_id);
       if (!page) return `页面 ${args.page_id} 不存在。`;
       const cats = (page.categories || []).map(c => MEMORY_CATEGORIES[c] || c).join(', ') || '无';
-      return `[${page.id}] ${page.day} | ${page.title} | 分类: ${cats}\n${page.content}`;
+      return `[${page.id}] ${page.date || '?'} | ${page.title} | 分类: ${cats}\n${page.content}`;
     }
     default:
       return '未知工具';
@@ -174,7 +174,7 @@ export function buildAgentPrompt(data, recentText, candidatePages, maxPages) {
     const formatted = candidatePages.map(p => {
       const cats = (p.categories || []).map(c => MEMORY_CATEGORIES[c] || c).join(', ') || '无';
       const content = p.content.length > 500 ? p.content.substring(0, 500) + '…' : p.content;
-      return `### [${p.id}] ${p.day} | ${p.title} | 分类: ${cats}\n${content}`;
+      return `### [${p.id}] ${p.date || '?'} | ${p.title} | 分类: ${cats}\n${content}`;
     }).join('\n\n');
     candidateSection = `\n## Embedding候选记忆（按语义相关度排序，完整内容）\n${formatted}`;
   }
@@ -183,7 +183,7 @@ export function buildAgentPrompt(data, recentText, candidatePages, maxPages) {
   const otherPages = allPages.filter(p => !candidateIds.has(p.id));
   let catalogSection = '';
   if (otherPages.length > 0) {
-    catalogSection = `\n## 其他记忆页面（仅标题，可用搜索工具探索）\n${otherPages.map(p => `[${p.id}] ${p.day} | ${p.title}`).join('\n')}`;
+    catalogSection = `\n## 其他记忆页面（仅标题，可用搜索工具探索）\n${otherPages.map(p => `[${p.id}] ${p.date || '?'} | ${p.title}`).join('\n')}`;
   }
 
   const charList = data.characters.map(c => `  ${c.name}: ${c.attitude || '(未知)'}`).join('\n');
@@ -402,7 +402,7 @@ export async function agentRetrieve(data, recentText, candidatePages, maxPages) 
   if (sourcePageIds.length > 0) {
     const readableSources = sourcePageIds.map(id => {
       const page = data.pages.find(p => p.id === id);
-      return page ? `${page.day}「${page.title}」` : id;
+      return page ? `${page.date || '?'}「${page.title}」` : id;
     });
     narrative += `\n来源: ${readableSources.join(' · ')}`;
   }

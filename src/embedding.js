@@ -230,7 +230,7 @@ export async function rebuildCategories() {
     for (let i = 0; i < pagesNeedingCats.length; i += batchSize) {
         const batch = pagesNeedingCats.slice(i, i + batchSize);
         const batchPrompt = batch.map(p =>
-            `[${p.id}] ${p.day} | ${p.title}\n内容: ${(p.content || '').substring(0, 200)}`,
+            `[${p.id}] ${p.date || '?'} | ${p.title}\n内容: ${(p.content || '').substring(0, 200)}`,
         ).join('\n\n');
 
         try {

@@ -83,7 +83,7 @@ export function updateBrowserUI(sections) {
 
     // Timeline
     if (all || sections.includes('timeline')) {
-        $('#mm_bible_timeline').text(data.timeline || '（尚无数据）');
+        $('#mm_bible_timeline').html(`<span class="mm-bible-preview-text">${escapeHtml(data.timeline || '（尚无数据）')}</span>`);
     }
 
     // Known character attitudes
@@ -199,7 +199,7 @@ function _updateSingleBadge(messageId, dates, data) {
     if (recalls && recalls.length > 0) {
         const pages = recalls.map(id => data.pages.find(p => p.id === id)).filter(Boolean);
         if (pages.length > 0) {
-            const titles = pages.map(p => `${p.day} ${p.title}`).join('\n');
+            const titles = pages.map(p => `${p.date || '?'} ${p.title}`).join('\n');
             const badge = $(`<div class="mm-recall-badge" title="${escapeHtml(titles)}">📖${pages.length}</div>`);
             el.find('.mes_block .ch_name').after(badge);
         }
@@ -295,6 +295,7 @@ function renderKnownCharsSection(data) {
                         <span class="mm-entry-field-label">态度</span>
                         <span class="mm-entry-field-value">${escapeHtml(c.attitude || '(未知)')}</span>
                     </div>
+                    ${c.metDate ? `<div class="mm-entry-field"><span class="mm-entry-field-label">初遇</span><span class="mm-entry-field-value">${escapeHtml(c.metDate)}</span></div>` : ''}
                 </div>
             </div>
         `);
@@ -318,6 +319,7 @@ function renderNpcCharsSection(data) {
         if (c.appearance) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">外貌</span><span class="mm-entry-field-value">${escapeHtml(c.appearance)}</span></div>`);
         if (c.personality) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">性格</span><span class="mm-entry-field-value">${escapeHtml(c.personality)}</span></div>`);
         if (c.attitude) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">态度</span><span class="mm-entry-field-value">${escapeHtml(c.attitude)}</span></div>`);
+        if (c.metDate) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">初遇</span><span class="mm-entry-field-value">${escapeHtml(c.metDate)}</span></div>`);
         if (c.keywords && c.keywords.length > 0) fields.push(`<div class="mm-entry-field"><span class="mm-entry-field-label">关键词</span><span class="mm-entry-field-value mm-entry-keywords">${escapeHtml(c.keywords.join('、'))}</span></div>`);
 
         const row = $(`
@@ -385,11 +387,11 @@ function renderPageList(data) {
         return;
     }
 
-    // Sort by day (numeric), then by createdAt
+    // Sort by date (YYYY-MM-DD string comparison), then by createdAt
     const sorted = [...pages].sort((a, b) => {
-        const da = parseInt((a.day || '').replace(/\D/g, '')) || 0;
-        const db = parseInt((b.day || '').replace(/\D/g, '')) || 0;
-        if (da !== db) return da - db;
+        const da = a.date || '';
+        const db = b.date || '';
+        if (da !== db) return da.localeCompare(db);
         return (a.createdAt || 0) - (b.createdAt || 0);
     });
 
@@ -414,8 +416,7 @@ function renderPageList(data) {
         const card = $(`
             <div class="mm-memory-card ${levelClass}" data-page-id="${page.id}">
                 <div class="mm-memory-card-header">
-                    <span class="mm-memory-card-day">${escapeHtml(page.day || '?')}</span>
-                    ${page.date ? `<span class="mm-memory-card-date">${escapeHtml(page.date)}</span>` : ''}
+                    <span class="mm-memory-card-date">${escapeHtml(page.date || '?')}</span>
                     <span class="mm-memory-card-title">${escapeHtml(page.title)}</span>
                     ${sigMark}
                     <span class="mm-memory-card-level ${levelClass}">${levelLabel}</span>
@@ -492,17 +493,13 @@ export function onEditPage(pageId) {
         <div class="mm-page-edit-panel">
             <div class="mm-page-edit-form">
                 <div class="mm-edit-field-row">
-                    <div class="mm-edit-field" style="flex:0 0 70px">
-                        <label>天数</label>
-                        <input type="text" class="mm-edit-day text_pole" value="${escapeHtml(page.day || '')}" />
-                    </div>
                     <div class="mm-edit-field" style="flex:1">
                         <label>标题</label>
                         <input type="text" class="mm-edit-title text_pole" value="${escapeHtml(page.title || '')}" />
                     </div>
-                    <div class="mm-edit-field" style="flex:0 0 110px">
+                    <div class="mm-edit-field" style="flex:0 0 130px">
                         <label>日期</label>
-                        <input type="text" class="mm-edit-date text_pole" value="${escapeHtml(page.date || '')}" placeholder="YYMMDD 如 251017" />
+                        <input type="text" class="mm-edit-date text_pole" value="${escapeHtml(page.date || '')}" placeholder="YYYY-MM-DD" />
                     </div>
                     <div class="mm-edit-field" style="flex:0 0 90px">
                         <label>重要性</label>
@@ -534,7 +531,6 @@ export function onEditPage(pageId) {
 
     panel.find('.mm-btn-save-entry').on('click', () => {
         page.title = panel.find('.mm-edit-title').val().trim() || page.title;
-        page.day = panel.find('.mm-edit-day').val().trim() || page.day;
         page.date = panel.find('.mm-edit-date').val().trim();
         page.content = panel.find('.mm-edit-content').val().trim() || page.content;
         page.keywords = panel.find('.mm-edit-keywords').val()
@@ -561,8 +557,8 @@ export function onAddPage() {
     const title = prompt('标题 (4-8字):');
     if (!title) return;
 
-    const day = prompt('天数 (如 D1):');
-    if (!day) return;
+    const date = prompt('日期 (YYYY-MM-DD，如 2025-01-01):');
+    if (date === null) return;
 
     const content = prompt('内容 (50-150字):');
     if (!content) return;
@@ -575,8 +571,7 @@ export function onAddPage() {
     const page = {
         id: `pg_${generateId()}`,
         title: title.trim(),
-        day: day.trim(),
-        date: '',
+        date: (date || '').trim(),
         content: content.trim(),
         keywords: (keywords || '').split(/[,，]/).map(k => k.trim()).filter(Boolean),
         categories: (cats || '').split(/[,，]/).map(c => c.trim()).filter(Boolean),
@@ -619,7 +614,11 @@ export function openEditKnownChar(charName) {
         <div class="mm-entry-edit-panel">
             <div class="mm-edit-field">
                 <label>对主角的态度</label>
-                <input type="text" class="mm-edit-attitude text_pole" value="${escapeHtml(char.attitude || '')}" />
+                <textarea class="mm-edit-attitude text_pole" rows="2">${escapeHtml(char.attitude || '')}</textarea>
+            </div>
+            <div class="mm-edit-field">
+                <label>初遇时间</label>
+                <input type="text" class="mm-edit-metdate text_pole" value="${escapeHtml(char.metDate || '')}" placeholder="YYYY-MM-DD" />
             </div>
             <div class="mm-edit-btns">
                 <button class="mm-btn-save-entry">保存</button>
@@ -630,6 +629,7 @@ export function openEditKnownChar(charName) {
 
     panel.find('.mm-btn-save-entry').on('click', () => {
         char.attitude = panel.find('.mm-edit-attitude').val().trim();
+        char.metDate = panel.find('.mm-edit-metdate').val().trim();
         saveMemoryData();
         updateBrowserUI(['knownChars']);
         toastr?.success?.(`已更新「${charName}」的态度`);
@@ -651,13 +651,15 @@ export function onAddKnownChar() {
     if (!name) return;
     const attitude = prompt('该角色对主角的态度:');
     if (attitude === null) return;
+    const metDate = prompt('初遇时间 (YYYY-MM-DD，可留空):') || '';
 
     const data = getMemoryData();
     const existing = data.knownCharacterAttitudes.find(c => c.name === name.trim());
     if (existing) {
         existing.attitude = attitude.trim();
+        if (metDate.trim()) existing.metDate = metDate.trim();
     } else {
-        data.knownCharacterAttitudes.push({ name: name.trim(), attitude: attitude.trim() });
+        data.knownCharacterAttitudes.push({ name: name.trim(), attitude: attitude.trim(), metDate: metDate.trim() });
     }
     saveMemoryData();
     updateBrowserUI(['knownChars']);
@@ -694,7 +696,11 @@ export function openEditNpcChar(charName) {
             </div>
             <div class="mm-edit-field">
                 <label>态度</label>
-                <input type="text" class="mm-edit-attitude text_pole" value="${escapeHtml(char.attitude || '')}" />
+                <textarea class="mm-edit-attitude text_pole" rows="2">${escapeHtml(char.attitude || '')}</textarea>
+            </div>
+            <div class="mm-edit-field">
+                <label>初遇时间</label>
+                <input type="text" class="mm-edit-metdate text_pole" value="${escapeHtml(char.metDate || '')}" placeholder="YYYY-MM-DD" />
             </div>
             <div class="mm-edit-field">
                 <label>关键词激活 <small style="opacity:0.6">（逗号分隔，用于关键词模式识别该角色）</small></label>
@@ -712,6 +718,7 @@ export function openEditNpcChar(charName) {
         char.appearance = panel.find('.mm-edit-appearance').val().trim();
         char.personality = panel.find('.mm-edit-personality').val().trim();
         char.attitude = panel.find('.mm-edit-attitude').val().trim();
+        char.metDate = panel.find('.mm-edit-metdate').val().trim();
         char.keywords = panel.find('.mm-edit-keywords').val()
             .split(/[,，]/).map(k => k.trim()).filter(Boolean);
         saveMemoryData();
@@ -740,6 +747,7 @@ export function onAddNpcChar() {
     const appearance = prompt('外貌:') || '';
     const personality = prompt('性格:') || '';
     const attitude = prompt('对主角态度:') || '';
+    const metDate = prompt('初遇时间 (YYYY-MM-DD，可留空):') || '';
     const keywordsRaw = prompt('关键词激活（可留空；逗号分隔，如：林医生,林晓薇）:') || '';
 
     const data = getMemoryData();
@@ -749,6 +757,7 @@ export function onAddNpcChar() {
         appearance: appearance.trim(),
         personality: personality.trim(),
         attitude: attitude.trim(),
+        metDate: metDate.trim(),
         keywords: keywordsRaw.trim() ? keywordsRaw.split(/[,，]/).map(k => k.trim()).filter(Boolean) : [],
     };
     data.characters.push(char);
@@ -782,7 +791,7 @@ export function openEditItem(itemName) {
         <div class="mm-entry-edit-panel">
             <div class="mm-edit-field">
                 <label>状态</label>
-                <input type="text" class="mm-edit-status text_pole" value="${escapeHtml(item.status || '')}" />
+                <textarea class="mm-edit-status text_pole" rows="2">${escapeHtml(item.status || '')}</textarea>
             </div>
             <div class="mm-edit-field">
                 <label>重要性</label>
@@ -832,12 +841,36 @@ export function onAddItem() {
 
 export function onEditTimelineClick() {
     const data = getMemoryData();
-    const newTl = prompt('编辑剧情时间线（每行一条，如 D1: 事件描述）:', data.timeline || '');
-    if (newTl === null) return;
-    data.timeline = newTl.trim();
-    saveMemoryData();
-    updateBrowserUI(['timeline']);
-    toastr?.success?.('时间线已更新');
+    const container = $('#mm_bible_timeline');
+
+    // Toggle: if already in edit mode, close
+    if (container.find('.mm-timeline-edit').length) {
+        container.find('.mm-timeline-edit').remove();
+        container.find('.mm-bible-preview-text').show();
+        return;
+    }
+
+    container.find('.mm-bible-preview-text').hide();
+    const editPanel = $(`
+        <div class="mm-timeline-edit">
+            <textarea class="mm-timeline-textarea text_pole" rows="10">${escapeHtml(data.timeline || '')}</textarea>
+            <div class="mm-edit-btns">
+                <button class="mm-btn-save-entry">保存</button>
+                <button class="mm-btn-cancel-entry">取消</button>
+            </div>
+        </div>
+    `);
+    editPanel.find('.mm-btn-save-entry').on('click', () => {
+        data.timeline = editPanel.find('.mm-timeline-textarea').val().trim();
+        saveMemoryData();
+        updateBrowserUI(['timeline']);
+        toastr?.success?.('时间线已更新');
+    });
+    editPanel.find('.mm-btn-cancel-entry').on('click', () => {
+        editPanel.remove();
+        container.find('.mm-bible-preview-text').show();
+    });
+    container.append(editPanel);
 }
 
 // ── Reset / Export / Import ──
@@ -889,6 +922,13 @@ export function onImportClick() {
 
             const ctx = getContext();
             ctx.chatMetadata.memoryManager = imported;
+
+            // Clear extractedMsgDates — it tracks the *source chat's* processing state
+            // and would cause false orphan detection in the current (different) chat.
+            if (imported.processing) {
+                imported.processing.extractedMsgDates = {};
+            }
+
             saveMemoryData();
 
             updateBrowserUI();

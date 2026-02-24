@@ -122,6 +122,13 @@ export async function loadFromSlot(charName, slotName) {
 
         const ctx = getContext();
         ctx.chatMetadata.memoryManager = imported;
+
+        // Clear extractedMsgDates — it tracks the *source chat's* processing state
+        // and would cause false orphan detection in the current (different) chat.
+        if (imported.processing) {
+            imported.processing.extractedMsgDates = {};
+        }
+
         saveMemoryData();
 
         // Update active slot

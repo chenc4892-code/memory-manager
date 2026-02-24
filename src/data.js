@@ -141,7 +141,6 @@ export function createDefaultData() {
         pages: [],
         embeddings: {},
         processing: {
-            lastExtractedMessageId: -1,
             extractionInProgress: false,
             extractedMsgDates: {},
         },
@@ -290,6 +289,8 @@ export function getMemoryData() {
     if (!d.processing.extractedMsgDates) {
         d.processing.extractedMsgDates = {};
     }
+    // Clean up deprecated watermark field
+    delete d.processing.lastExtractedMessageId;
     if (!d.managerDirective || typeof d.managerDirective !== 'object') {
         d.managerDirective = { global: '', extraction: '', recall: '', compression: '' };
     }

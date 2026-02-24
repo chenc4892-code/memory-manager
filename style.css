@@ -294,9 +294,12 @@
 }
 
 .mm-memory-card-date {
-    font-size: 10px;
-    opacity: 0.6;
-    color: var(--SmartThemeBodyColor, #aaa);
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--SmartThemeQuoteColor, #555);
+    color: var(--SmartThemeBodyColor, #fff);
+    font-size: 11px;
+    font-weight: 600;
 }
 
 .mm-memory-card-title {
@@ -430,6 +433,21 @@
 }
 
 /* ── Misc ── */
+
+.mm-timeline-edit {
+    margin-top: 4px;
+}
+
+.mm-timeline-textarea {
+    width: 100%;
+    min-height: 120px;
+    resize: vertical;
+    font-size: 12px;
+    line-height: 1.6;
+    font-family: monospace;
+    white-space: pre-wrap;
+    box-sizing: border-box;
+}
 
 .mm-version {
     font-size: 11px;

@@ -37,7 +37,8 @@ export function formatStoryIndex(data) {
         parts.push(`\n三、已有角色对${userName}态度/关系`);
         for (const c of data.knownCharacterAttitudes) {
             if (c.attitude) {
-                parts.push(`· ${c.name}: ${c.attitude}`);
+                const met = c.metDate ? `(初遇${c.metDate})` : '';
+                parts.push(`· ${c.name}${met}: ${c.attitude}`);
             }
         }
     }
@@ -96,7 +97,7 @@ export function formatRecalledPages(pages) {
 
     const parts = ['[记忆闪回]'];
     for (const page of pages) {
-        parts.push(`回忆起了……「${page.title}」(${page.day})`);
+        parts.push(`回忆起了……「${page.title}」(${page.date || '?'})`);
         parts.push(page.content);
         parts.push('');
     }
@@ -130,7 +131,7 @@ export function getDirectiveSuffix(stage) {
 
 // ── Extraction Prompts ──
 
-export function buildExtractionPrompt(data, newMessages) {
+export function buildExtractionPrompt(data, newMessages, worldBookContext = '') {
     const ctx = getContext();
     const userName = ctx.name1 || '{{user}}';
     const knownNames = getKnownCharacterNames();
@@ -155,22 +156,25 @@ export function buildExtractionPrompt(data, newMessages) {
 ### 1. 更新时间线
 基于现有时间线和新消息，输出更新后的完整时间线。
 格式规则:
-- 每行格式 "D{天数}: 短句"，每行不超过30字，像书的目录一样简洁，只写关键转折
-- 旧事件合并为 "D{起}-D{止}: 一句话概括"，不超过30字，保留旧条目的核心信息（大幅压缩措辞）
+- 每行格式 "YYYY-MM-DD: 短句"，每行不超过30字，像书的目录一样简洁，只写关键转折
+- 日期不确定时写 "????-??-??"
+- 旧事件合并为 "YYYY-MM-DD~YYYY-MM-DD: 一句话概括"，不超过30字，保留旧条目的核心信息（大幅压缩措辞）
 - 按时间线排列，控制在15行以内
-- 示例: "D1: 纽约初遇，自由女神像约会" "D2-D4: 共同调查失踪案，发现线索"
+- 示例: "2025-01-01: 纽约初遇，自由女神像约会" "2025-01-02~2025-01-04: 共同调查失踪案，发现线索"
 
 ### 2. 更新角色信息
 分两类输出：
 
 **已知角色**（${knownCharNamesStr}）— 只更新态度：
-  输出到 knownCharacterAttitudes 数组，每项: {name, attitude}
+  输出到 knownCharacterAttitudes 数组，每项: {name, attitude, metDate}
   attitude: 该角色对主角（${userName}）的态度/关系变化轨迹，言简意赅
+  metDate: 与主角初次相遇的日期，格式 YYYY-MM-DD。从消息推断，不确定则留空字符串，已有值则保持不变
 
 **新NPC角色**（不含主角"${userName}"、不含已知角色）：
-  输出到 newCharacters 数组，每项: {name, role, appearance, personality, attitude, keywords}
+  输出到 newCharacters 数组，每项: {name, role, appearance, personality, attitude, keywords, metDate}
   role: 一句话身份简介，如"主角的私人医生"、"旅馆老板娘"（可留空）
   keywords: 用于识别该角色的关键词数组（含姓名、昵称、称呼等，2-5个，如["林医生","林晓薇","晓薇"]）
+  metDate: 与主角初次相遇的日期，格式 YYYY-MM-DD。从消息推断，不确定则留空字符串
   仅收录剧情中新登场的、非已知角色列表中的NPC
 
 ### 3. 更新重要物品
@@ -185,8 +189,7 @@ export function buildExtractionPrompt(data, newMessages) {
 
 每个页面包含:
 - title: 短标题（4-8字）
-- day: 对应时间线中的D几
-- date: 剧情中的具体日期，格式 YYMMDD（如 "251017"）。从消息中的状态栏/时间描述提取，无法确定则留空字符串
+- date: 剧情中的具体日期，格式 YYYY-MM-DD（如 "2025-10-17"）。从消息中的状态栏/时间描述提取，无法确定则留空字符串
 - content: 以事件为单位，记录因果链（50-150字）。规则：
   · 写"为什么"而非仅写"做了什么"（因果关系优先）
     ❌ "她典当了项链，去买了衣服"
@@ -225,20 +228,19 @@ ${itemsJson}
 
 ## 新消息内容
 ${newMessages}
-
-
+${worldBookContext ? `\n## 世界书/角色卡参考信息（辅助理解背景设定，不要直接照搬）\n${worldBookContext}\n` : ''}
 
 ## 输出格式
 严格按以下JSON格式输出，用markdown代码块包裹：
 
 \`\`\`json
 {
-  "timeline": "D1: 短句\\nD2: 短句",
+  "timeline": "2025-01-01: 短句\\n2025-01-02: 短句",
   "knownCharacterAttitudes": [
-    {"name": "...", "attitude": "..."}
+    {"name": "...", "attitude": "...", "metDate": "2025-01-01"}
   ],
   "newCharacters": [
-    {"name": "...", "role": "...", "appearance": "...", "personality": "...", "attitude": "...", "keywords": ["...", "..."]}
+    {"name": "...", "role": "...", "appearance": "...", "personality": "...", "attitude": "...", "keywords": ["...", "..."], "metDate": "2025-01-01"}
   ],
   "items": [
     {"name": "...", "status": "...", "significance": "..."}
@@ -246,8 +248,7 @@ ${newMessages}
   "newPages": [
     {
       "title": "...",
-      "day": "D1",
-      "date": "251017",
+      "date": "2025-01-01",
       "content": "...",
       "keywords": ["...", "..."],
       "categories": ["emotional", "relationship"],
@@ -264,7 +265,7 @@ ${newMessages}
 - newCharacters 不含主角"${userName}"和已知角色
 - items要输出完整列表（含未变化的旧条目）
 - newPages仅包含本批消息中提取的新页面
-- date格式为YYMMDD（如 "251017" 表示2025年10月17日），从消息中的状态栏/时间信息提取，不确定则留空
+- date格式为YYYY-MM-DD（如 "2025-10-17"），从消息中的状态栏/时间信息提取，不确定则留空
 - categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
 - 时间线每行不超过30字，像目录一样简洁
 ]` + getDirectiveSuffix('extraction');
@@ -293,25 +294,28 @@ export function buildInitExtractionPrompt(data, messages) {
 ### 1. 更新时间线
 将本批内容中的事件整合进时间线。
 格式规则:
-- 每行格式 "D{天数}: 短句"，每行不超过30字
-- 旧事件合并为 "D{起}-D{止}: 一句话概括"，不超过30字
+- 每行格式 "YYYY-MM-DD: 短句"，每行不超过30字
+- 日期不确定时写 "????-??-??"
+- 旧事件合并为 "YYYY-MM-DD~YYYY-MM-DD: 一句话概括"，不超过30字
 - 像书的目录一样简洁，只写关键转折
 - 保留旧条目核心信息
 - 按时间线排列，控制在15行以内
-- 示例: "D1: 纽约初遇，自由女神像约会"
+- 示例: "2025-01-01: 纽约初遇，自由女神像约会"
 
 ### 2. 更新角色信息
 分两类输出：
 
 **已知角色**（${knownCharNamesStr}）— 只更新态度：
-  输出到 knownCharacterAttitudes 数组，每项: {name, attitude}
+  输出到 knownCharacterAttitudes 数组，每项: {name, attitude, metDate}
   attitude: 该角色对主角（${userName}）的态度/关系变化轨迹
+  metDate: 与主角初次相遇的日期，格式 YYYY-MM-DD。从消息推断，不确定则留空字符串，已有值则保持不变
   禁止忽略此项！
 
 **新NPC角色**（不含主角"${userName}"、不含已知角色）：
-  输出到 newCharacters 数组，每项: {name, role, appearance, personality, attitude, keywords}
+  输出到 newCharacters 数组，每项: {name, role, appearance, personality, attitude, keywords, metDate}
   role: 一句话身份简介，如"主角的私人医生"（可留空）
   keywords: 用于识别该角色的关键词数组（含姓名、昵称、称呼等，2-5个，如["林医生","林晓薇","晓薇"]）
+  metDate: 与主角初次相遇的日期，格式 YYYY-MM-DD。从消息推断，不确定则留空字符串
 
 ### 3. 更新重要物品
 更新物品名+位置+持有人+简述，仅为**有重要意义、会在后续剧情产生影响的物品**建立档案，不记录可乐薯片等消耗品
@@ -325,8 +329,7 @@ export function buildInitExtractionPrompt(data, messages) {
 
 每页包含:
 - title: 短标题（4-8字）
-- day: 对应时间线中的D几
-- date: 剧情中的具体日期，格式 YYMMDD（如 "251017"）。从消息中的状态栏/时间描述提取，无法确定则留空字符串
+- date: 剧情中的具体日期，格式 YYYY-MM-DD（如 "2025-10-17"）。从消息中的状态栏/时间描述提取，无法确定则留空字符串
 - content: 以事件为单位，记录因果链（50-150字）。规则：
   · 写"为什么"而非仅写"做了什么"（因果关系优先）
     ❌ "她典当了项链，去买了衣服"
@@ -352,7 +355,7 @@ export function buildInitExtractionPrompt(data, messages) {
 - newCharacters 不含主角"${userName}"和已知角色
 - items要输出完整列表
 - newPages要为每个值得记录的事件都创建，不要遗漏
-- date格式为YYMMDD（如 "251017" 表示2025年10月17日），从消息中的状态栏/时间信息提取，不确定则留空
+- date格式为YYYY-MM-DD（如 "2025-10-17"），从消息中的状态栏/时间信息提取，不确定则留空
 - categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
 - 时间线每行不超过30字，像目录一样简洁
 
@@ -381,12 +384,12 @@ ${messages}
 
 \`\`\`json
 {
-  "timeline": "D1: 短句\\nD2: 短句",
+  "timeline": "2025-01-01: 短句\\n2025-01-02: 短句",
   "knownCharacterAttitudes": [
-    {"name": "...", "attitude": "..."}
+    {"name": "...", "attitude": "...", "metDate": "2025-01-01"}
   ],
   "newCharacters": [
-    {"name": "...", "role": "...", "appearance": "...", "personality": "...", "attitude": "...", "keywords": ["...", "..."]}
+    {"name": "...", "role": "...", "appearance": "...", "personality": "...", "attitude": "...", "keywords": ["...", "..."], "metDate": "2025-01-01"}
   ],
   "items": [
     {"name": "...", "status": "...", "significance": "..."}
@@ -394,8 +397,7 @@ ${messages}
   "newPages": [
     {
       "title": "...",
-      "day": "D1",
-      "date": "251017",
+      "date": "2025-01-01",
       "content": "...",
       "keywords": ["...", "..."],
       "categories": ["emotional", "relationship"],
@@ -413,16 +415,29 @@ export function mergeTimelines(oldTimeline, newTimeline) {
     if (!oldTimeline) return newTimeline || '';
     if (!newTimeline) return oldTimeline;
 
-    // Parse D-entries from each timeline
+    // Parse date-based entries (YYYY-MM-DD or YYYY-MM-DD~YYYY-MM-DD)
+    // Also supports legacy D-format for backward compatibility
     function parseEntries(tl) {
         const entries = [];
         for (const line of tl.split('\n')) {
-            const m = line.match(/^D(\d+)(?:\s*-\s*D?(\d+))?:\s*(.*)$/);
-            if (m) {
+            // New format: 2025-01-01: ... or 2025-01-01~2025-01-03: ...
+            const mDate = line.match(/^(\d{4}-\d{2}-\d{2})(?:\s*~\s*(\d{4}-\d{2}-\d{2}))?\s*:\s*(.*)$/);
+            if (mDate) {
                 entries.push({
-                    start: parseInt(m[1]),
-                    end: parseInt(m[2] || m[1]),
-                    text: m[3],
+                    start: mDate[1],
+                    end: mDate[2] || mDate[1],
+                    text: mDate[3],
+                    raw: line,
+                });
+                continue;
+            }
+            // Legacy format: D1: ... or D1-D3: ...
+            const mDay = line.match(/^D(\d+)(?:\s*-\s*D?(\d+))?:\s*(.*)$/);
+            if (mDay) {
+                entries.push({
+                    start: mDay[1].padStart(10, '0'),
+                    end: (mDay[2] || mDay[1]).padStart(10, '0'),
+                    text: mDay[3],
                     raw: line,
                 });
             }
@@ -435,9 +450,9 @@ export function mergeTimelines(oldTimeline, newTimeline) {
 
     if (newEntries.length === 0) return oldTimeline;
 
-    // Determine the range covered by new timeline
-    const newStart = Math.min(...newEntries.map(e => e.start));
-    const newEnd = Math.max(...newEntries.map(e => e.end));
+    // Determine the range covered by new timeline (string comparison works for YYYY-MM-DD)
+    const newStart = newEntries.reduce((min, e) => e.start < min ? e.start : min, newEntries[0].start);
+    const newEnd = newEntries.reduce((max, e) => e.end > max ? e.end : max, newEntries[0].end);
 
     // Keep old entries that are NOT covered by the new timeline's range
     const keptOld = oldEntries.filter(e => e.end < newStart || e.start > newEnd);
