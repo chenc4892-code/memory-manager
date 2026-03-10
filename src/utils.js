@@ -101,6 +101,21 @@ export function parseJsonResponse(text) {
         }
     }
 
+    // Strategy 4: truncation repair — attempt to close unclosed brackets/strings
+    {
+        const repaired = repairTruncatedJson(text);
+        if (repaired) {
+            const fixed = fixJsonString(repaired);
+            try {
+                const result = JSON.parse(fixed);
+                warn('Strategy 4: truncation repair SUCCESS (data may be partial), keys:', Object.keys(result));
+                return result;
+            } catch (e) {
+                warn('Strategy 4: truncation repair also failed:', e.message);
+            }
+        }
+    }
+
     warn('Could not parse JSON from response. First 500 chars:', text.substring(0, 500));
     return null;
 }
@@ -156,4 +171,70 @@ export function fixJsonString(raw) {
 
     result = result.replace(/,\s*([}\]])/g, '$1');
     return result;
+}
+
+export function repairTruncatedJson(text) {
+    // Find the first '{' to start from
+    const start = text.indexOf('{');
+    if (start === -1) return null;
+
+    let raw = text.substring(start);
+    let inString = false;
+    let escaped = false;
+    const stack = []; // track '{' and '['
+    let lastValidPos = 0;
+
+    for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+
+        if (ch === '\\' && inString) {
+            escaped = true;
+            continue;
+        }
+
+        if (ch === '"') {
+            inString = !inString;
+            continue;
+        }
+
+        if (!inString) {
+            if (ch === '{') stack.push('}');
+            else if (ch === '[') stack.push(']');
+            else if (ch === '}' || ch === ']') {
+                if (stack.length > 0 && stack[stack.length - 1] === ch) {
+                    stack.pop();
+                }
+            }
+            if (stack.length === 0) {
+                // Complete JSON object found — no repair needed
+                return raw.substring(0, i + 1);
+            }
+        }
+
+        lastValidPos = i;
+    }
+
+    // Truncated: build repair suffix
+    let repaired = raw.substring(0, lastValidPos + 1);
+
+    // Close unclosed string
+    if (inString) {
+        repaired += '"';
+    }
+
+    // Remove trailing comma or incomplete key-value
+    repaired = repaired.replace(/,\s*$/, '');
+    repaired = repaired.replace(/,\s*"[^"]*$/, '');
+
+    // Close remaining brackets in reverse order
+    for (let i = stack.length - 1; i >= 0; i--) {
+        repaired += stack[i];
+    }
+
+    return repaired;
 }

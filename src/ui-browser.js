@@ -130,18 +130,29 @@ export function updateBrowserUI(sections) {
 export function updateStatusDisplay() {
     const data = getMemoryData();
     const ctx = getContext();
+    const s = getSettings();
     const dates = data.processing.extractedMsgDates || {};
 
-    // Count by scanning actual chat messages — avoid inflating pending
-    // with messages that share a send_date key or have no trackable date.
-    // is_system (auto-hidden) messages still have send_date and must be included.
+    // Compute buffer zone size (matching performExtraction logic)
+    let bufferSize = 0;
+    if (s.autoHide && s.keepRecentMessages >= 3) {
+        bufferSize = Math.max(0, s.keepRecentMessages - 2);
+    }
+
+    // Count by scanning actual chat messages
     let extractedCount = 0;
     let pendingCount = 0;
+    let bufferCount = 0;
     if (ctx.chat) {
-        for (const msg of ctx.chat) {
-            if (!msg || !msg.send_date) continue; // no trackable key → skip
+        const chatLen = ctx.chat.length;
+        const bufferStart = Math.max(0, chatLen - bufferSize);
+        for (let i = 0; i < chatLen; i++) {
+            const msg = ctx.chat[i];
+            if (!msg || !msg.send_date) continue;
             if (dates[msg.send_date]) {
                 extractedCount++;
+            } else if (i >= bufferStart && bufferSize > 0) {
+                bufferCount++;
             } else {
                 pendingCount++;
             }
@@ -153,11 +164,11 @@ export function updateStatusDisplay() {
     } else if (extractedCount > 0) {
         $('#mm_status_text').text('就绪');
     } else {
-        $('#mm_status_text').text('未初始化');
+        $('#mm_status_text').text('就绪 · 等待新消息');
     }
 
     $('#mm_processed_count').text(extractedCount);
-    $('#mm_pending_count').text(pendingCount);
+    $('#mm_pending_count').text(bufferCount > 0 ? `${pendingCount} (+${bufferCount} 缓冲)` : pendingCount);
 }
 
 // ── Unextracted Badges ──
@@ -927,6 +938,15 @@ export function onImportClick() {
             // and would cause false orphan detection in the current (different) chat.
             if (imported.processing) {
                 imported.processing.extractedMsgDates = {};
+            }
+
+            // Mark all current chat messages as extracted to avoid false "unprocessed" counts
+            if (ctx.chat && imported.processing) {
+                for (const msg of ctx.chat) {
+                    if (msg && msg.send_date) {
+                        imported.processing.extractedMsgDates[msg.send_date] = true;
+                    }
+                }
             }
 
             saveMemoryData();

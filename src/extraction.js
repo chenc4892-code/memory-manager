@@ -392,7 +392,14 @@ export async function safeExtract(force = false, range = null) {
         // Normal mode: date-mark-based incremental extraction
         const dates = data.processing.extractedMsgDates || {};
         const highestIdx = getHighestExtractedIndex(ctx.chat, dates);
-        const pendingCount = ctx.chat.length - 1 - highestIdx;
+
+        // Exclude buffer zone to match performExtraction's actual processing range
+        let effectiveEnd = ctx.chat.length;
+        if (s.autoHide && s.keepRecentMessages >= 3) {
+            const buffer = Math.max(0, s.keepRecentMessages - 2);
+            effectiveEnd = Math.max(0, ctx.chat.length - buffer);
+        }
+        const pendingCount = Math.max(0, effectiveEnd - 1 - highestIdx);
         if (pendingCount < s.extractionInterval) return;
 
         data.processing.extractionInProgress = true;

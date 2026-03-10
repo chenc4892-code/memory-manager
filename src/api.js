@@ -44,7 +44,7 @@ export async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
     }
     messages.push({ role: 'user', content: userPrompt });
 
-    log('Calling secondary API via server proxy:', baseUrl, 'model:', s.secondaryApiModel);
+    log('Calling secondary API via server proxy (streaming):', baseUrl, 'model:', s.secondaryApiModel);
 
     const response = await fetch('/api/backends/chat-completions/generate', {
         method: 'POST',
@@ -57,7 +57,7 @@ export async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
             messages: messages,
             temperature: s.secondaryApiTemperature ?? 0.3,
             max_tokens: (maxTokens && maxTokens > 0) ? maxTokens : undefined,
-            stream: false,
+            stream: true,
         }),
     });
 
@@ -66,25 +66,66 @@ export async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
         throw new Error(`Secondary API error ${response.status}: ${errText.substring(0, 200)}`);
     }
 
-    const responseText = await response.text();
-    let data;
-    try {
-        data = JSON.parse(responseText);
-    } catch (e) {
-        warn('Failed to parse server response as JSON:', e.message, 'raw:', responseText.substring(0, 300));
-        throw new Error(`Server response is not valid JSON: ${e.message}`);
-    }
-
-    let content = data.choices?.[0]?.message?.content;
-    if (!content && typeof data === 'string') content = data;
+    // Stream SSE response and accumulate content
+    const content = await readSSEStream(response);
 
     if (!content) {
-        warn('Secondary API response structure:', JSON.stringify(data).substring(0, 500));
         throw new Error('Secondary API returned empty response');
     }
 
-    log('Secondary API response length:', content.length);
     return content;
+}
+
+/**
+ * Read an SSE stream from a fetch Response and accumulate delta content.
+ * Returns the full accumulated text. Handles both normal completion ([DONE])
+ * and premature stream termination (returns partial content).
+ */
+async function readSSEStream(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let accumulated = '';
+    let buffer = '';
+    let done = false;
+
+    try {
+        while (!done) {
+            const { value, done: streamDone } = await reader.read();
+            if (streamDone) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            // Process complete SSE lines
+            const lines = buffer.split('\n');
+            // Keep the last incomplete line in buffer
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (!line.startsWith('data:')) continue;
+
+                const payload = line.slice(5).trimStart();
+                if (payload === '[DONE]') {
+                    done = true;
+                    break;
+                }
+
+                try {
+                    const parsed = JSON.parse(payload);
+                    const delta = parsed.choices?.[0]?.delta?.content;
+                    if (delta) accumulated += delta;
+                } catch {
+                    // Non-JSON data line, skip
+                }
+            }
+        }
+    } catch (err) {
+        warn('SSE stream error:', err.message, '— returning', accumulated.length, 'chars accumulated so far');
+    } finally {
+        reader.releaseLock();
+    }
+
+    log('Secondary API response length:', accumulated.length, done ? '(complete)' : '(truncated)');
+    return accumulated;
 }
 
 /**

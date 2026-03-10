@@ -129,6 +129,15 @@ export async function loadFromSlot(charName, slotName) {
             imported.processing.extractedMsgDates = {};
         }
 
+        // Mark all current chat messages as extracted to avoid false "unprocessed" counts
+        if (ctx.chat && imported.processing) {
+            for (const msg of ctx.chat) {
+                if (msg && msg.send_date) {
+                    imported.processing.extractedMsgDates[msg.send_date] = true;
+                }
+            }
+        }
+
         saveMemoryData();
 
         // Update active slot

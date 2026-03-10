@@ -1,5 +1,5 @@
 /**
- * Memory Manager v5.5 — Modular Architecture
+ * Memory Manager v5.7 — Modular Architecture
  *
  * Thin entry point: jQuery init, event binding, settings panel wiring.
  * All business logic lives in src/ modules.
@@ -209,7 +209,35 @@ function bindSettingsPanel() {
     });
 
     // Action buttons
-    $('#mm_force_extract').on('click', () => safeExtract(true));
+    $('#mm_force_extract').on('click', () => {
+        const data = getMemoryData();
+        const ctx = getContext();
+        const chat = ctx.chat || [];
+        const dates = data.processing.extractedMsgDates || {};
+
+        // Count unextracted messages (excluding buffer of 4)
+        const endIdx = Math.max(0, chat.length - 4);
+        let pending = 0;
+        for (let i = 0; i < endIdx; i++) {
+            const m = chat[i];
+            if (!m || !m.mes || !m.send_date) continue;
+            if (!dates[m.send_date]) pending++;
+        }
+
+        if (pending === 0) {
+            toastr?.info?.('所有消息均已提取，没有需要处理的内容', 'Memory Manager');
+            return;
+        }
+
+        const ok = confirm(
+            `即将强制提取 ${pending} 条未处理消息。\n\n` +
+            `· 大量消息提取可能耗时较长且消耗较多token\n` +
+            `· 如只需提取部分楼层，可使用右下角工具箱的"分楼层提取"\n` +
+            `· 正常情况下自动提取会自行处理新消息\n\n` +
+            `确定继续？`,
+        );
+        if (ok) safeExtract(true);
+    });
     $('#mm_force_compress').on('click', async () => {
         await safeCompress(true);
         updateBrowserUI();
@@ -361,7 +389,7 @@ function fullInitialize() {
     registerSlashCommands();
     updateBrowserUI();
 
-    log('Memory Manager v5.5 (Modular) initialized');
+    log('Memory Manager v5.7 (Modular) initialized');
 }
 
 jQuery(async function () {

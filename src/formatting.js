@@ -6,148 +6,148 @@
 import { getMemoryData, getKnownCharacterNames, getSettings } from './data.js';
 
 import {
-    getContext,
+  getContext,
 } from '../../../../extensions.js';
 
 // ── Story Index Formatting ──
 
 export function formatStoryIndex(data) {
-    const s = getSettings();
-    const mode = s.npcInjectionMode || 'half';
-    const parts = ['[故事索引]'];
-    const ctx = getContext();
-    const userName = ctx.name1 || '{{user}}';
+  const s = getSettings();
+  const mode = s.npcInjectionMode || 'half';
+  const parts = ['[故事索引]'];
+  const ctx = getContext();
+  const userName = ctx.name1 || '{{user}}';
 
-    // Timeline (compact)
-    if (data.timeline) {
-        parts.push('一、剧情时间线');
-        parts.push(data.timeline);
+  // Timeline (compact)
+  if (data.timeline) {
+    parts.push('一、剧情时间线');
+    parts.push(data.timeline);
+  }
+
+  // Item index (compact)
+  if (data.items.length > 0) {
+    parts.push('\n二、物品');
+    for (const item of data.items) {
+      parts.push(`· ${item.name} | ${item.status || ''}`);
     }
+  }
 
-    // Item index (compact)
-    if (data.items.length > 0) {
-        parts.push('\n二、物品');
-        for (const item of data.items) {
-            parts.push(`· ${item.name} | ${item.status || ''}`);
+  // Known character attitudes (always show all)
+  if (data.knownCharacterAttitudes && data.knownCharacterAttitudes.length > 0) {
+    parts.push(`\n三、已有角色对${userName}态度/关系`);
+    for (const c of data.knownCharacterAttitudes) {
+      if (c.attitude) {
+        const met = c.metDate ? `(初遇${c.metDate})` : '';
+        parts.push(`· ${c.name}${met}: ${c.attitude}`);
+      }
+    }
+  }
+
+  // NPC section — controlled by npcInjectionMode
+  if (data.characters.length > 0) {
+    if (mode === 'full') {
+      // Full: always inject complete dossiers
+      parts.push('\n四、已登场NPC档案');
+      for (const c of data.characters) {
+        parts.push(formatDossier(c));
+      }
+    } else if (mode === 'keyword') {
+      // Keyword activation: scan recent N messages, inject dossier only for matched NPCs
+      const scanDepth = s.npcKeywordScanDepth || 4;
+      const recentMsgs = (ctx.chat || []).slice(-scanDepth);
+      const recentText = recentMsgs.map(m => m.mes || '').join(' ').toLowerCase();
+
+      const activated = [];
+      const dormant = [];
+      for (const c of data.characters) {
+        // Use character's keywords array; fallback to name if empty
+        const kws = (c.keywords && c.keywords.length > 0) ? c.keywords : [c.name];
+        const matched = kws.some(kw => recentText.includes(kw.toLowerCase()));
+        if (matched) activated.push(c);
+        else dormant.push(c);
+      }
+
+      if (activated.length > 0) {
+        parts.push('\n四、已登场NPC档案（激活）');
+        for (const c of activated) {
+          parts.push(formatDossier(c));
         }
-    }
-
-    // Known character attitudes (always show all)
-    if (data.knownCharacterAttitudes && data.knownCharacterAttitudes.length > 0) {
-        parts.push(`\n三、已有角色对${userName}态度/关系`);
-        for (const c of data.knownCharacterAttitudes) {
-            if (c.attitude) {
-                const met = c.metDate ? `(初遇${c.metDate})` : '';
-                parts.push(`· ${c.name}${met}: ${c.attitude}`);
-            }
+        if (dormant.length > 0) {
+          const dormantNames = dormant.map(c => c.role ? `${c.name}（${c.role}）` : c.name).join('、');
+          parts.push(`\n五、其他NPC: ${dormantNames}`);
         }
+      } else {
+        // Nothing activated — fall back to half mode
+        const names = data.characters.map(c => c.role ? `${c.name}（${c.role}）` : c.name).join('、');
+        parts.push(`\n四、已登场NPC: ${names}`);
+      }
+    } else {
+      // 'half' (default): names + role hints only
+      const names = data.characters.map(c => c.role ? `${c.name}（${c.role}）` : c.name).join('、');
+      parts.push(`\n四、已登场NPC: ${names}`);
     }
+  }
 
-    // NPC section — controlled by npcInjectionMode
-    if (data.characters.length > 0) {
-        if (mode === 'full') {
-            // Full: always inject complete dossiers
-            parts.push('\n四、已登场NPC档案');
-            for (const c of data.characters) {
-                parts.push(formatDossier(c));
-            }
-        } else if (mode === 'keyword') {
-            // Keyword activation: scan recent N messages, inject dossier only for matched NPCs
-            const scanDepth = s.npcKeywordScanDepth || 4;
-            const recentMsgs = (ctx.chat || []).slice(-scanDepth);
-            const recentText = recentMsgs.map(m => m.mes || '').join(' ').toLowerCase();
-
-            const activated = [];
-            const dormant = [];
-            for (const c of data.characters) {
-                // Use character's keywords array; fallback to name if empty
-                const kws = (c.keywords && c.keywords.length > 0) ? c.keywords : [c.name];
-                const matched = kws.some(kw => recentText.includes(kw.toLowerCase()));
-                if (matched) activated.push(c);
-                else dormant.push(c);
-            }
-
-            if (activated.length > 0) {
-                parts.push('\n四、已登场NPC档案（激活）');
-                for (const c of activated) {
-                    parts.push(formatDossier(c));
-                }
-                if (dormant.length > 0) {
-                    const dormantNames = dormant.map(c => c.role ? `${c.name}（${c.role}）` : c.name).join('、');
-                    parts.push(`\n五、其他NPC: ${dormantNames}`);
-                }
-            } else {
-                // Nothing activated — fall back to half mode
-                const names = data.characters.map(c => c.role ? `${c.name}（${c.role}）` : c.name).join('、');
-                parts.push(`\n四、已登场NPC: ${names}`);
-            }
-        } else {
-            // 'half' (default): names + role hints only
-            const names = data.characters.map(c => c.role ? `${c.name}（${c.role}）` : c.name).join('、');
-            parts.push(`\n四、已登场NPC: ${names}`);
-        }
-    }
-
-    parts.push('[/故事索引]');
-    return parts.join('\n');
+  parts.push('[/故事索引]');
+  return parts.join('\n');
 }
 
 export function formatRecalledPages(pages) {
-    if (pages.length === 0) return '';
+  if (pages.length === 0) return '';
 
-    const parts = ['[记忆闪回]'];
-    for (const page of pages) {
-        parts.push(`回忆起了……「${page.title}」(${page.date || '?'})`);
-        parts.push(page.content);
-        parts.push('');
-    }
-    parts.push('[/记忆闪回]');
-    return parts.join('\n');
+  const parts = ['[记忆闪回]'];
+  for (const page of pages) {
+    parts.push(`回忆起了……「${page.title}」(${page.date || '?'})`);
+    parts.push(page.content);
+    parts.push('');
+  }
+  parts.push('[/记忆闪回]');
+  return parts.join('\n');
 }
 
 export function formatDossier(character) {
-    const parts = [];
-    parts.push(`[角色档案: ${character.name}]`);
-    if (character.role) parts.push(`身份: ${character.role}`);
-    if (character.appearance) parts.push(`外貌: ${character.appearance}`);
-    if (character.personality) parts.push(`性格: ${character.personality}`);
-    if (character.attitude) parts.push(`对主角态度: ${character.attitude}`);
-    parts.push(`[/角色档案]`);
-    return parts.join('\n');
+  const parts = [];
+  parts.push(`[角色档案: ${character.name}]`);
+  if (character.role) parts.push(`身份: ${character.role}`);
+  if (character.appearance) parts.push(`外貌: ${character.appearance}`);
+  if (character.personality) parts.push(`性格: ${character.personality}`);
+  if (character.attitude) parts.push(`对主角态度: ${character.attitude}`);
+  parts.push(`[/角色档案]`);
+  return parts.join('\n');
 }
 
 // ── Directive Suffix ──
 
 export function getDirectiveSuffix(stage) {
-    const data = getMemoryData();
-    const dir = data.managerDirective;
-    if (!dir) return '';
-    const parts = [];
-    if (dir.global && dir.global.trim()) parts.push(dir.global.trim());
-    if (dir[stage] && dir[stage].trim()) parts.push(dir[stage].trim());
-    if (parts.length === 0) return '';
-    return `\n\n## 用户对记忆管理的特别要求\n${parts.join('\n')}\n请在执行任务时遵循以上要求。`;
+  const data = getMemoryData();
+  const dir = data.managerDirective;
+  if (!dir) return '';
+  const parts = [];
+  if (dir.global && dir.global.trim()) parts.push(dir.global.trim());
+  if (dir[stage] && dir[stage].trim()) parts.push(dir[stage].trim());
+  if (parts.length === 0) return '';
+  return `\n\n## 用户对记忆管理的特别要求\n${parts.join('\n')}\n请在执行任务时遵循以上要求。`;
 }
 
 // ── Extraction Prompts ──
 
 export function buildExtractionPrompt(data, newMessages, worldBookContext = '') {
-    const ctx = getContext();
-    const userName = ctx.name1 || '{{user}}';
-    const knownNames = getKnownCharacterNames();
-    const knownCharNamesStr = knownNames.size > 0 ? [...knownNames].join('、') : '（无）';
+  const ctx = getContext();
+  const userName = ctx.name1 || '{{user}}';
+  const knownNames = getKnownCharacterNames();
+  const knownCharNamesStr = knownNames.size > 0 ? [...knownNames].join('、') : '（无）';
 
-    const knownAttJson = data.knownCharacterAttitudes.length > 0
-        ? JSON.stringify(data.knownCharacterAttitudes, null, 2)
-        : '[]';
-    const charsJson = data.characters.length > 0
-        ? JSON.stringify(data.characters, null, 2)
-        : '[]';
-    const itemsJson = data.items.length > 0
-        ? JSON.stringify(data.items, null, 2)
-        : '[]';
+  const knownAttJson = data.knownCharacterAttitudes.length > 0
+    ? JSON.stringify(data.knownCharacterAttitudes, null, 2)
+    : '[]';
+  const charsJson = data.characters.length > 0
+    ? JSON.stringify(data.characters, null, 2)
+    : '[]';
+  const itemsJson = data.items.length > 0
+    ? JSON.stringify(data.items, null, 2)
+    : '[]';
 
-    return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。
+  return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。
 ## 任务
 全局要求：
 - 语言简洁客观，理清剧情脉络与事件起因经过结果，梗概清晰
@@ -156,8 +156,8 @@ export function buildExtractionPrompt(data, newMessages, worldBookContext = '') 
 ### 1. 更新时间线
 基于现有时间线和新消息，输出更新后的完整时间线。
 格式规则:
-- 每行格式 "YYYY-MM-DD: 短句"，每行不超过30字，像书的目录一样简洁，只写关键转折
-- 日期不确定时写 "????-??-??"
+- 每行格式 "YYYY-MM-DD: 短句"，每行不超过30字，像书的目录一样简洁，只写关键转折和事件
+- 日期不确定时写 "????-??-??"或留空
 - 旧事件合并为 "YYYY-MM-DD~YYYY-MM-DD: 一句话概括"，不超过30字，保留旧条目的核心信息（大幅压缩措辞）
 - 按时间线排列，控制在15行以内
 - 示例: "2025-01-01: 纽约初遇，自由女神像约会" "2025-01-02~2025-01-04: 共同调查失踪案，发现线索"
@@ -183,7 +183,7 @@ export function buildExtractionPrompt(data, newMessages, worldBookContext = '') 
 每个物品: name, status, significance
 
 ### 4. 提取故事页（Story Pages）
-从消息中提取值得记录的事件。每个页面是一个完整事件的因果记录。
+从新消息中提取值得记录的事件。每个页面是一个完整事件的因果记录。
 任何改变事件走向、揭示关键信息、推动关系变化的事件都应记录。
 日常噪音（补妆、移动、整理仪容等不影响剧情的动作）不记录。
 
@@ -262,8 +262,8 @@ ${worldBookContext ? `\n## 世界书/角色卡参考信息（辅助理解背景�
 - 只输出JSON代码块，不要有其他文字
 - 角色名使用实际名字
 - knownCharacterAttitudes 只含已知角色（${knownCharNamesStr}）
-- newCharacters 不含主角"${userName}"和已知角色
-- items要输出完整列表（含未变化的旧条目）
+- newCharacters 不含主角"${userName}"和已知角色，仅输出有变化的角色或新增角色
+- items仅输出新增的或有状态变化的物品，描述简洁
 - newPages仅包含本批消息中提取的新页面
 - date格式为YYYY-MM-DD（如 "2025-10-17"），从消息中的状态栏/时间信息提取，不确定则留空
 - categories从以下选1-3个: emotional, relationship, intimate, promise, conflict, discovery, turning_point, daily
@@ -272,22 +272,22 @@ ${worldBookContext ? `\n## 世界书/角色卡参考信息（辅助理解背景�
 }
 
 export function buildInitExtractionPrompt(data, messages) {
-    const ctx = getContext();
-    const userName = ctx.name1 || '{{user}}';
-    const knownNames = getKnownCharacterNames();
-    const knownCharNamesStr = knownNames.size > 0 ? [...knownNames].join('、') : '（无）';
+  const ctx = getContext();
+  const userName = ctx.name1 || '{{user}}';
+  const knownNames = getKnownCharacterNames();
+  const knownCharNamesStr = knownNames.size > 0 ? [...knownNames].join('、') : '（无）';
 
-    const knownAttJson = data.knownCharacterAttitudes.length > 0
-        ? JSON.stringify(data.knownCharacterAttitudes, null, 2)
-        : '[]';
-    const charsJson = data.characters.length > 0
-        ? JSON.stringify(data.characters, null, 2)
-        : '[]';
-    const itemsJson = data.items.length > 0
-        ? JSON.stringify(data.items, null, 2)
-        : '[]';
+  const knownAttJson = data.knownCharacterAttitudes.length > 0
+    ? JSON.stringify(data.knownCharacterAttitudes, null, 2)
+    : '[]';
+  const charsJson = data.characters.length > 0
+    ? JSON.stringify(data.characters, null, 2)
+    : '[]';
+  const itemsJson = data.items.length > 0
+    ? JSON.stringify(data.items, null, 2)
+    : '[]';
 
-    return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。以下是你的任务要求
+  return `[OOC: 停止角色扮演。你现在是剧情记忆管理系统。以下是你的任务要求
 
     ## 剧情记忆管理任务
 
@@ -412,57 +412,57 @@ ${messages}
 // ── Timeline Merge ──
 
 export function mergeTimelines(oldTimeline, newTimeline) {
-    if (!oldTimeline) return newTimeline || '';
-    if (!newTimeline) return oldTimeline;
+  if (!oldTimeline) return newTimeline || '';
+  if (!newTimeline) return oldTimeline;
 
-    // Parse date-based entries (YYYY-MM-DD or YYYY-MM-DD~YYYY-MM-DD)
-    // Also supports legacy D-format for backward compatibility
-    function parseEntries(tl) {
-        const entries = [];
-        for (const line of tl.split('\n')) {
-            // New format: 2025-01-01: ... or 2025-01-01~2025-01-03: ...
-            const mDate = line.match(/^(\d{4}-\d{2}-\d{2})(?:\s*~\s*(\d{4}-\d{2}-\d{2}))?\s*:\s*(.*)$/);
-            if (mDate) {
-                entries.push({
-                    start: mDate[1],
-                    end: mDate[2] || mDate[1],
-                    text: mDate[3],
-                    raw: line,
-                });
-                continue;
-            }
-            // Legacy format: D1: ... or D1-D3: ...
-            const mDay = line.match(/^D(\d+)(?:\s*-\s*D?(\d+))?:\s*(.*)$/);
-            if (mDay) {
-                entries.push({
-                    start: mDay[1].padStart(10, '0'),
-                    end: (mDay[2] || mDay[1]).padStart(10, '0'),
-                    text: mDay[3],
-                    raw: line,
-                });
-            }
-        }
-        return entries;
+  // Parse date-based entries (YYYY-MM-DD or YYYY-MM-DD~YYYY-MM-DD)
+  // Also supports legacy D-format for backward compatibility
+  function parseEntries(tl) {
+    const entries = [];
+    for (const line of tl.split('\n')) {
+      // New format: 2025-01-01: ... or 2025-01-01~2025-01-03: ...
+      const mDate = line.match(/^(\d{4}-\d{2}-\d{2})(?:\s*~\s*(\d{4}-\d{2}-\d{2}))?\s*:\s*(.*)$/);
+      if (mDate) {
+        entries.push({
+          start: mDate[1],
+          end: mDate[2] || mDate[1],
+          text: mDate[3],
+          raw: line,
+        });
+        continue;
+      }
+      // Legacy format: D1: ... or D1-D3: ...
+      const mDay = line.match(/^D(\d+)(?:\s*-\s*D?(\d+))?:\s*(.*)$/);
+      if (mDay) {
+        entries.push({
+          start: mDay[1].padStart(10, '0'),
+          end: (mDay[2] || mDay[1]).padStart(10, '0'),
+          text: mDay[3],
+          raw: line,
+        });
+      }
     }
+    return entries;
+  }
 
-    const oldEntries = parseEntries(oldTimeline);
-    const newEntries = parseEntries(newTimeline);
+  const oldEntries = parseEntries(oldTimeline);
+  const newEntries = parseEntries(newTimeline);
 
-    if (newEntries.length === 0) return oldTimeline;
+  if (newEntries.length === 0) return oldTimeline;
 
-    // Determine the range covered by new timeline (string comparison works for YYYY-MM-DD)
-    const newStart = newEntries.reduce((min, e) => e.start < min ? e.start : min, newEntries[0].start);
-    const newEnd = newEntries.reduce((max, e) => e.end > max ? e.end : max, newEntries[0].end);
+  // Determine the range covered by new timeline (string comparison works for YYYY-MM-DD)
+  const newStart = newEntries.reduce((min, e) => e.start < min ? e.start : min, newEntries[0].start);
+  const newEnd = newEntries.reduce((max, e) => e.end > max ? e.end : max, newEntries[0].end);
 
-    // Keep old entries that are NOT covered by the new timeline's range
-    const keptOld = oldEntries.filter(e => e.end < newStart || e.start > newEnd);
+  // Keep old entries that are NOT covered by the new timeline's range
+  const keptOld = oldEntries.filter(e => e.end < newStart || e.start > newEnd);
 
-    // Merge: old entries before new range + new entries + old entries after new range
-    const merged = [
-        ...keptOld.filter(e => e.end < newStart).map(e => e.raw),
-        ...newEntries.map(e => e.raw),
-        ...keptOld.filter(e => e.start > newEnd).map(e => e.raw),
-    ];
+  // Merge: old entries before new range + new entries + old entries after new range
+  const merged = [
+    ...keptOld.filter(e => e.end < newStart).map(e => e.raw),
+    ...newEntries.map(e => e.raw),
+    ...keptOld.filter(e => e.start > newEnd).map(e => e.raw),
+  ];
 
-    return merged.join('\n');
+  return merged.join('\n');
 }
