@@ -30,6 +30,15 @@ import {
 const $ = window.jQuery;
 const toastr = window.toastr;
 
+function formatHealthTime(ts, fallback = '从未') {
+    if (!ts) return fallback;
+    try {
+        return new Date(ts).toLocaleString('zh-CN', { hour12: false });
+    } catch {
+        return fallback;
+    }
+}
+
 // ── Main Update Function ──
 
 /**
@@ -54,6 +63,9 @@ export function updateBrowserUI(sections) {
         $('#mm_max_pages').val(s.maxPages);
         $('#mm_max_pages_value').text(s.maxPages);
         $('#mm_show_recall_badges').prop('checked', s.showRecallBadges);
+        $('#mm_request_timeout_enabled').prop('checked', !!s.requestTimeoutEnabled);
+        $('#mm_request_timeout_fields').toggle(!!s.requestTimeoutEnabled);
+        $('#mm_request_timeout_seconds').val(s.requestTimeoutSeconds ?? 90);
         $('#mm_compress_timeline').prop('checked', s.compressTimeline);
         $('#mm_compress_pages').prop('checked', s.compressPages);
         $('#mm_archive_daily').prop('checked', s.archiveDaily);
@@ -132,6 +144,7 @@ export function updateStatusDisplay() {
     const ctx = getContext();
     const s = getSettings();
     const dates = data.processing.extractedMsgDates || {};
+    const diagnostics = data.diagnostics || {};
 
     // Compute buffer zone size (matching performExtraction logic)
     let bufferSize = 0;
@@ -158,6 +171,30 @@ export function updateStatusDisplay() {
             }
         }
     }
+
+    let statusText = '';
+    if (data.processing.extractionInProgress) {
+        statusText = '提取中...';
+    } else if (extractedCount > 0) {
+        statusText = '就绪';
+    } else {
+        statusText = '就绪 · 等待新消息';
+    }
+
+    if (diagnostics.lastHealthNotice && diagnostics.lastHealthNoticeAt
+        && (Date.now() - diagnostics.lastHealthNoticeAt) <= 15000) {
+        statusText += ` · ${diagnostics.lastHealthNotice}`;
+    }
+
+    $('#mm_status_text').text(statusText);
+    $('#mm_processed_count').text(extractedCount);
+    $('#mm_pending_count').text(bufferCount > 0 ? `${pendingCount} (+${bufferCount} 缓冲)` : pendingCount);
+    $('#mm_last_success_time').text(formatHealthTime(diagnostics.lastSuccessfulExtractionAt));
+    $('#mm_consecutive_failures').text(diagnostics.consecutiveFailures ?? 0);
+    $('#mm_lock_state').text(data.processing.extractionInProgress ? '存在' : '无');
+    $('#mm_last_recovery_time').text(formatHealthTime(diagnostics.lastLockRecoveryAt));
+    $('#mm_health_notice').text(diagnostics.lastHealthNotice || '无');
+    return;
 
     if (data.processing.extractionInProgress) {
         $('#mm_status_text').text('提取中...');
@@ -510,7 +547,7 @@ export function onEditPage(pageId) {
                     </div>
                     <div class="mm-edit-field" style="flex:0 0 130px">
                         <label>日期</label>
-                        <input type="text" class="mm-edit-date text_pole" value="${escapeHtml(page.date || '')}" placeholder="YYYY-MM-DD" />
+                        <input type="text" class="mm-edit-date text_pole" value="${escapeHtml(page.date || '')}" placeholder="YYYY-MM-DD 或原文时间标签" />
                     </div>
                     <div class="mm-edit-field" style="flex:0 0 90px">
                         <label>重要性</label>
@@ -568,7 +605,7 @@ export function onAddPage() {
     const title = prompt('标题 (4-8字):');
     if (!title) return;
 
-    const date = prompt('日期 (YYYY-MM-DD，如 2025-01-01):');
+    const date = prompt('日期/时间标签 (如 2025-01-01、星历42年仲夏):');
     if (date === null) return;
 
     const content = prompt('内容 (50-150字):');
@@ -629,7 +666,7 @@ export function openEditKnownChar(charName) {
             </div>
             <div class="mm-edit-field">
                 <label>初遇时间</label>
-                <input type="text" class="mm-edit-metdate text_pole" value="${escapeHtml(char.metDate || '')}" placeholder="YYYY-MM-DD" />
+                <input type="text" class="mm-edit-metdate text_pole" value="${escapeHtml(char.metDate || '')}" placeholder="YYYY-MM-DD 或原文时间标签" />
             </div>
             <div class="mm-edit-btns">
                 <button class="mm-btn-save-entry">保存</button>
@@ -662,7 +699,7 @@ export function onAddKnownChar() {
     if (!name) return;
     const attitude = prompt('该角色对主角的态度:');
     if (attitude === null) return;
-    const metDate = prompt('初遇时间 (YYYY-MM-DD，可留空):') || '';
+    const metDate = prompt('初遇时间 (YYYY-MM-DD 或原文时间标签，可留空):') || '';
 
     const data = getMemoryData();
     const existing = data.knownCharacterAttitudes.find(c => c.name === name.trim());
@@ -711,7 +748,7 @@ export function openEditNpcChar(charName) {
             </div>
             <div class="mm-edit-field">
                 <label>初遇时间</label>
-                <input type="text" class="mm-edit-metdate text_pole" value="${escapeHtml(char.metDate || '')}" placeholder="YYYY-MM-DD" />
+                <input type="text" class="mm-edit-metdate text_pole" value="${escapeHtml(char.metDate || '')}" placeholder="YYYY-MM-DD 或原文时间标签" />
             </div>
             <div class="mm-edit-field">
                 <label>关键词激活 <small style="opacity:0.6">（逗号分隔，用于关键词模式识别该角色）</small></label>
@@ -758,7 +795,7 @@ export function onAddNpcChar() {
     const appearance = prompt('外貌:') || '';
     const personality = prompt('性格:') || '';
     const attitude = prompt('对主角态度:') || '';
-    const metDate = prompt('初遇时间 (YYYY-MM-DD，可留空):') || '';
+    const metDate = prompt('初遇时间 (YYYY-MM-DD 或原文时间标签，可留空):') || '';
     const keywordsRaw = prompt('关键词激活（可留空；逗号分隔，如：林医生,林晓薇）:') || '';
 
     const data = getMemoryData();

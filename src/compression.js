@@ -52,6 +52,23 @@ ${timeline}
 
 // ── Core Compression Functions ──
 
+export function buildFlexibleTimelineCompressionPrompt(timeline, maxEntries) {
+    return `[OOC: 以下剧情时间线条目过多，请压缩。
+## 当前时间线
+${timeline}
+
+## 压缩规则
+1. 最新几条保持不动。
+2. 更早的条目可以合并，但必须保留原有时间体系。
+3. 如果原文是标准日期，可合并成日期范围；如果原文是架空纪年、季节、章节、time字段等非标准时间，继续保留原文时间标签，不要强行改写成 D1 或 YYYY-MM-DD。
+4. 合并后的每条不超过30字，像目录一样简洁，只保留核心转折。
+5. 压缩后总行数不超过 ${maxEntries} 行。
+6. 不得遗漏重要转折点或关系变化。
+
+## 输出
+只输出压缩后的时间线文本，每行一条。不要JSON，不要代码块，不要解释。]` + getDirectiveSuffix('compression');
+}
+
 export async function compressPage(data, pageId) {
     const page = data.pages.find(p => p.id === pageId);
     if (!page || page.compressionLevel !== COMPRESS_FRESH) return;
@@ -115,7 +132,7 @@ export async function compressTimeline(data) {
     log('Timeline has', lines.length, 'entries, compressing to', s.maxTimelineEntries);
 
     try {
-        const prompt = buildTimelineCompressionPrompt(data.timeline, s.maxTimelineEntries);
+        const prompt = buildFlexibleTimelineCompressionPrompt(data.timeline, s.maxTimelineEntries);
         const compressed = await callLLM(
             '你是时间线压缩助手。只输出压缩后的时间线。',
             prompt,

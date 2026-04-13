@@ -15,10 +15,67 @@ import {
     getSortedEntries,
 } from '../../../../world-info.js';
 
+function getTimeoutMs() {
+    const s = getSettings();
+    if (!s.requestTimeoutEnabled) return 0;
+    const seconds = Math.max(5, Number(s.requestTimeoutSeconds) || 90);
+    return seconds * 1000;
+}
+
+export function getActiveApiName() {
+    const s = getSettings();
+    if (s.useSecondaryApi && s.secondaryApiUrl && s.secondaryApiKey) {
+        return 'secondary';
+    }
+    return 'primary';
+}
+
+function buildTimeoutError(ms) {
+    return new Error(`Request timed out after ${Math.round(ms / 1000)}s`);
+}
+
+async function withSoftTimeout(task, ms) {
+    if (!ms || ms <= 0) return await task();
+
+    let timeoutId = null;
+    try {
+        return await Promise.race([
+            task(),
+            new Promise((_, reject) => {
+                timeoutId = setTimeout(() => reject(buildTimeoutError(ms)), ms);
+            }),
+        ]);
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+    }
+}
+
+async function fetchWithTimeout(url, options, ms) {
+    if (!ms || ms <= 0) return await fetch(url, options);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(buildTimeoutError(ms)), ms);
+
+    try {
+        return await fetch(url, {
+            ...options,
+            signal: controller.signal,
+        });
+    } catch (err) {
+        if (controller.signal.aborted) {
+            throw buildTimeoutError(ms);
+        }
+        throw err;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+}
+
 // ── Primary / Secondary API ──
 
 export async function callLLM(systemPrompt, userPrompt, maxTokens = null) {
     const s = getSettings();
+    const timeoutMs = getTimeoutMs();
 
     if (s.useSecondaryApi && s.secondaryApiUrl && s.secondaryApiKey) {
         return await callSecondaryApi(systemPrompt, userPrompt, maxTokens);
@@ -29,7 +86,10 @@ export async function callLLM(systemPrompt, userPrompt, maxTokens = null) {
     const fullPrompt = systemPrompt
         ? `${systemPrompt}\n\n${userPrompt}`
         : userPrompt;
-    return await generateQuietPrompt(fullPrompt, false, true, null, null, maxTokens || s.extractionMaxTokens);
+    return await withSoftTimeout(
+        () => generateQuietPrompt(fullPrompt, false, true, null, null, maxTokens || s.extractionMaxTokens),
+        timeoutMs,
+    );
 }
 
 export async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
@@ -46,7 +106,7 @@ export async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
 
     log('Calling secondary API via server proxy (streaming):', baseUrl, 'model:', s.secondaryApiModel);
 
-    const response = await fetch('/api/backends/chat-completions/generate', {
+    const response = await fetchWithTimeout('/api/backends/chat-completions/generate', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({
@@ -59,7 +119,7 @@ export async function callSecondaryApi(systemPrompt, userPrompt, maxTokens) {
             max_tokens: (maxTokens && maxTokens > 0) ? maxTokens : undefined,
             stream: true,
         }),
-    });
+    }, getTimeoutMs());
 
     if (!response.ok) {
         const errText = await response.text().catch(() => '');
@@ -159,11 +219,11 @@ export async function callSecondaryApiWithTools(systemPrompt, userPrompt, tools,
         tool_choice: 'auto',
     };
 
-    const response = await fetch('/api/backends/chat-completions/generate', {
+    const response = await fetchWithTimeout('/api/backends/chat-completions/generate', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify(body),
-    });
+    }, getTimeoutMs());
 
     if (!response.ok) {
         const errText = await response.text().catch(() => '');
@@ -225,11 +285,11 @@ export async function callSecondaryApiChat(messages, tools, maxTokens) {
         body.tools = tools;
         body.tool_choice = 'auto';
     }
-    const response = await fetch('/api/backends/chat-completions/generate', {
+    const response = await fetchWithTimeout('/api/backends/chat-completions/generate', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify(body),
-    });
+    }, getTimeoutMs());
     if (!response.ok) {
         const errText = await response.text().catch(() => '');
         throw new Error(`Secondary API error ${response.status}: ${errText.substring(0, 200)}`);

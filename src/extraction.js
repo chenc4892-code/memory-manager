@@ -16,7 +16,7 @@ import {
     getMemoryData, saveMemoryData, getSettings,
     getKnownCharacterNames,
 } from './data.js';
-import { callLLM, gatherWorldBookContext } from './api.js';
+import { callLLM, gatherWorldBookContext, getActiveApiName } from './api.js';
 import { buildExtractionPrompt, mergeTimelines } from './formatting.js';
 import { setMood } from './mood.js';
 import { isEmbeddingConfigured, embedPage, embedCharacter } from './embedding.js';
@@ -45,9 +45,293 @@ export function setExtractionUI(callbacks) {
 // ── Module State ──
 
 let consecutiveFailures = 0;
+const EXTRACTION_STALE_MS = 10 * 60 * 1000;
+const HEALTH_NOTICE_MS = 15 * 1000;
+const RECENT_EVENT_LIMIT = 20;
+const TIMELINE_WARNING_THRESHOLD = 3;
+const QUEUED_EXTRACTION_DELAY_MS = 500;
+const extractionQueue = {
+    timerId: null,
+    running: false,
+    rerunRequested: false,
+    sources: new Set(),
+};
 
 export function resetConsecutiveFailures() {
     consecutiveFailures = 0;
+    const data = getMemoryData();
+    if (data?.diagnostics) {
+        data.diagnostics.consecutiveFailures = 0;
+        saveMemoryData();
+    }
+}
+
+export function resetExtractionQueue() {
+    if (extractionQueue.timerId) {
+        clearTimeout(extractionQueue.timerId);
+        extractionQueue.timerId = null;
+    }
+    extractionQueue.running = false;
+    extractionQueue.rerunRequested = false;
+    extractionQueue.sources.clear();
+}
+
+function addRecentEvent(data, event) {
+    if (!data?.diagnostics) return;
+    const entry = {
+        at: Date.now(),
+        ...event,
+    };
+    data.diagnostics.recentEvents.push(entry);
+    if (data.diagnostics.recentEvents.length > RECENT_EVENT_LIMIT) {
+        data.diagnostics.recentEvents = data.diagnostics.recentEvents.slice(-RECENT_EVENT_LIMIT);
+    }
+    saveMemoryData();
+}
+
+function setHealthNotice(data, text) {
+    if (!data?.diagnostics) return;
+    data.diagnostics.lastHealthNotice = text || '';
+    data.diagnostics.lastHealthNoticeAt = text ? Date.now() : 0;
+    saveMemoryData();
+}
+
+function setConsecutiveFailureCount(data, count) {
+    consecutiveFailures = Math.max(0, count || 0);
+    if (!data?.diagnostics) return;
+    data.diagnostics.consecutiveFailures = consecutiveFailures;
+    saveMemoryData();
+}
+
+function markExtractionSuccess(data) {
+    setConsecutiveFailureCount(data, 0);
+    if (!data?.diagnostics) return;
+    data.diagnostics.lastSuccessfulExtractionAt = Date.now();
+    data.diagnostics.lastFailureAt = 0;
+    data.diagnostics.lastFailureReason = '';
+    saveMemoryData();
+}
+
+function markExtractionFailure(data, reason) {
+    const nextCount = consecutiveFailures + 1;
+    setConsecutiveFailureCount(data, nextCount);
+    if (!data?.diagnostics) return;
+    data.diagnostics.lastFailureAt = Date.now();
+    data.diagnostics.lastFailureReason = reason || '';
+    saveMemoryData();
+}
+
+function markLockRecovered(data, reason, elapsedMs = 0) {
+    if (!data?.diagnostics) return;
+    data.diagnostics.lastLockRecoveryAt = Date.now();
+    data.diagnostics.lastLockRecoveryReason = reason || '';
+    setHealthNotice(data, '已从异常中恢复');
+    addRecentEvent(data, {
+        type: 'lock_recovery',
+        source: reason || 'auto',
+        started: false,
+        recovered: true,
+        success: true,
+        api: getActiveApiName(),
+        reason: elapsedMs > 0 ? `${reason || 'recovered'} after ${Math.round(elapsedMs / 1000)}s` : (reason || 'recovered'),
+    });
+}
+
+function getHealthNotice(data) {
+    const diagnostics = data?.diagnostics;
+    if (!diagnostics?.lastHealthNotice || !diagnostics.lastHealthNoticeAt) return '';
+    if ((Date.now() - diagnostics.lastHealthNoticeAt) > HEALTH_NOTICE_MS) return '';
+    return diagnostics.lastHealthNotice;
+}
+
+function normalizeString(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value.trim();
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value).trim();
+    return '';
+}
+
+function normalizeStringList(value) {
+    if (Array.isArray(value)) {
+        return value
+            .map(item => normalizeString(item))
+            .filter(Boolean);
+    }
+    const single = normalizeString(value);
+    return single ? [single] : [];
+}
+
+function normalizeTimelineValue(value) {
+    if (typeof value === 'string') return value.trim();
+    if (Array.isArray(value)) {
+        return value.map(item => {
+            if (typeof item === 'string') return item.trim();
+            if (item && typeof item === 'object') {
+                const label = normalizeString(item.time || item.date || item.label || item.key);
+                const event = normalizeString(item.event || item.content || item.value || item.summary);
+                if (label && event) return `${label}: ${event}`;
+                if (label) return label;
+                return '';
+            }
+            return normalizeString(item);
+        }).filter(Boolean).join('\n');
+    }
+    if (value && typeof value === 'object') {
+        const entries = Object.entries(value)
+            .map(([key, item]) => {
+                const left = normalizeString(key);
+                const right = normalizeString(item);
+                return left && right ? `${left}: ${right}` : '';
+            })
+            .filter(Boolean);
+        return entries.join('\n');
+    }
+    return '';
+}
+
+function normalizeObjectArray(value) {
+    if (Array.isArray(value)) return value.filter(item => item && typeof item === 'object');
+    if (value && typeof value === 'object') return [value];
+    return [];
+}
+
+function normalizeExtractionResult(raw) {
+    const result = (raw && typeof raw === 'object') ? raw : {};
+    const normalized = {
+        timeline: normalizeTimelineValue(result.timeline),
+        knownCharacterAttitudes: normalizeObjectArray(result.knownCharacterAttitudes).map(item => ({
+            name: normalizeString(item.name),
+            attitude: normalizeString(item.attitude || item.relationship),
+            metDate: normalizeString(item.metDate || item.date || item.time),
+        })).filter(item => item.name),
+        newCharacters: normalizeObjectArray(result.newCharacters).map(item => ({
+            name: normalizeString(item.name),
+            role: normalizeString(item.role),
+            appearance: normalizeString(item.appearance),
+            personality: normalizeString(item.personality),
+            attitude: normalizeString(item.attitude || item.relationship),
+            keywords: normalizeStringList(item.keywords),
+            metDate: normalizeString(item.metDate || item.date || item.time),
+        })).filter(item => item.name),
+        characters: normalizeObjectArray(result.characters).map(item => ({
+            name: normalizeString(item.name),
+            appearance: normalizeString(item.appearance),
+            personality: normalizeString(item.personality),
+            attitude: normalizeString(item.attitude || item.relationship),
+        })).filter(item => item.name),
+        items: normalizeObjectArray(result.items).map(item => ({
+            name: normalizeString(item.name),
+            status: normalizeString(item.status),
+            significance: normalizeString(item.significance),
+        })).filter(item => item.name),
+        newPages: normalizeObjectArray(result.newPages).map(item => ({
+            date: normalizeString(item.date || item.time),
+            title: normalizeString(item.title),
+            content: normalizeString(item.content || item.summary || item.description),
+            keywords: normalizeStringList(item.keywords),
+            categories: normalizeStringList(item.categories),
+            significance: normalizeString(item.significance),
+        })).filter(item => item.title && item.content),
+    };
+
+    if (!Array.isArray(result.newPages) && result.newPages !== undefined) {
+        warn('Extraction result newPages was not an array; falling back to empty array');
+        addRecentEvent(getMemoryData(), {
+            type: 'parse_warning',
+            source: 'newPages',
+            started: false,
+            success: false,
+            api: getActiveApiName(),
+            reason: 'newPages was not an array; ignored',
+        });
+        normalized.newPages = [];
+    }
+
+    return normalized;
+}
+
+function trackTimelineHealth(data, resultStats, source) {
+    if (!data?.diagnostics) return;
+    if (resultStats.newPageCount > 0 && !resultStats.timelineChanged) {
+        data.diagnostics.timelineNoChangeWarnings += 1;
+        const count = data.diagnostics.timelineNoChangeWarnings;
+        const reason = `new pages created without timeline update (${count})`;
+        warn('Timeline did not change even though new pages were created');
+        addRecentEvent(data, {
+            type: 'timeline_warning',
+            source,
+            started: false,
+            success: false,
+            api: getActiveApiName(),
+            reason,
+        });
+        if (count >= TIMELINE_WARNING_THRESHOLD) {
+            toastr?.warning?.('时间线连续多次没有更新，模型可能没有按要求返回 timeline。', 'Memory Manager', { timeOut: 5000 });
+        }
+    } else if (resultStats.timelineChanged) {
+        data.diagnostics.timelineNoChangeWarnings = 0;
+        saveMemoryData();
+    }
+}
+
+function markExtractionStarted(data) {
+    const now = Date.now();
+    data.processing.extractionInProgress = true;
+    data.processing.extractionStartedAt = now;
+    data.processing.lastExtractionActivityAt = now;
+    saveMemoryData();
+}
+
+function touchExtractionActivity(data) {
+    if (!data?.processing?.extractionInProgress) return;
+    data.processing.lastExtractionActivityAt = Date.now();
+    saveMemoryData();
+}
+
+function clearExtractionLock(data) {
+    if (!data?.processing) return;
+    data.processing.extractionInProgress = false;
+    data.processing.extractionStartedAt = 0;
+    data.processing.lastExtractionActivityAt = 0;
+    saveMemoryData();
+}
+
+function recoverStaleExtractionLock(data, force = false) {
+    if (!data?.processing?.extractionInProgress) return false;
+
+    const lastActivity = data.processing.lastExtractionActivityAt || data.processing.extractionStartedAt || 0;
+    const elapsed = Date.now() - lastActivity;
+    if (!force && elapsed < EXTRACTION_STALE_MS) return false;
+
+    log('Auto-recovering stale extraction lock', { elapsedMs: elapsed, force });
+    warn(`Clearing stale extraction lock after ${Math.round(elapsed / 1000)}s`);
+    clearExtractionLock(data);
+    markLockRecovered(data, force ? 'forced-lock-reset' : 'stale-lock-recovered', elapsed);
+    return true;
+}
+
+function getExtractionWindow(chat, dates, settings) {
+    if (!Array.isArray(chat) || chat.length === 0) {
+        return { startIdx: -1, endIdx: 0, pendingMsgs: [] };
+    }
+
+    let endIdx = chat.length;
+    if (settings.autoHide && settings.keepRecentMessages >= 3) {
+        const buffer = Math.max(0, settings.keepRecentMessages - 2);
+        endIdx = Math.max(0, chat.length - buffer);
+    }
+
+    let startIdx = -1;
+    const pendingMsgs = [];
+    for (let i = 0; i < endIdx; i++) {
+        const msg = chat[i];
+        if (!msg || msg.is_system || !msg.mes) continue;
+        if (msg.send_date && dates[msg.send_date]) continue;
+        if (startIdx === -1) startIdx = i;
+        pendingMsgs.push(msg);
+    }
+
+    return { startIdx, endIdx, pendingMsgs };
 }
 
 // ── Core Functions ──
@@ -69,6 +353,8 @@ export function getHighestExtractedIndex(chat, dates) {
 }
 
 export function applyExtractionResult(data, result, sourceDates = []) {
+    const previousTimeline = data.timeline || '';
+
     // Update timeline (merge to prevent data loss from weak LLM outputs)
     if (result.timeline) {
         data.timeline = mergeTimelines(data.timeline, result.timeline);
@@ -232,7 +518,11 @@ export function applyExtractionResult(data, result, sourceDates = []) {
             newPageIds.push(newId);
         }
     }
-    return newPageIds;
+    return {
+        newPageIds,
+        newPageCount: newPageIds.length,
+        timelineChanged: (data.timeline || '') !== previousTimeline,
+    };
 }
 
 /** Mark messages as extracted by their send_date */
@@ -249,26 +539,14 @@ export function markMsgsExtracted(data, messages) {
  * Perform incremental extraction based on extractedMsgDates.
  * NOTE: Does NOT call updateBrowserUI(). Caller (safeExtract) handles post-extraction flow.
  */
-export async function performExtraction() {
+export async function performExtraction(source = 'auto') {
     const ctx = getContext();
     const data = getMemoryData();
+    const s = getSettings();
     const chat = ctx.chat;
     const dates = data.processing.extractedMsgDates || {};
-    const lastId = getHighestExtractedIndex(chat, dates);
-
-    const startIdx = Math.max(0, lastId + 1);
-    if (startIdx >= chat.length) return;
-
-    // Buffer zone: skip recent N-2 messages to avoid extracting content user might re-roll
-    const s = getSettings();
-    let endIdx = chat.length; // exclusive
-    if (s.autoHide && s.keepRecentMessages >= 3) {
-        const buffer = Math.max(0, s.keepRecentMessages - 2);
-        endIdx = Math.max(startIdx, chat.length - buffer);
-    }
-    if (startIdx >= endIdx) return;
-
-    const pendingMsgs = chat.slice(startIdx, endIdx).filter(m => !m.is_system && m.mes);
+    const { startIdx, endIdx, pendingMsgs } = getExtractionWindow(chat, dates, s);
+    if (startIdx < 0 || startIdx >= endIdx) return;
     if (pendingMsgs.length === 0) return;
 
     const BATCH_THRESHOLD = 25;
@@ -280,6 +558,7 @@ export async function performExtraction() {
         log('Extracting from messages', startIdx, 'to', endIdx - 1, `(buffer: skipping last ${chat.length - endIdx} msgs)`);
 
         const prompt = buildExtractionPrompt(data, newMsgs);
+        touchExtractionActivity(data);
         const response = await callLLM(
             '你是剧情记忆管理系统。严格按要求输出JSON。',
             prompt,
@@ -288,12 +567,14 @@ export async function performExtraction() {
 
         log('Extraction response length:', response?.length);
 
-        const result = parseJsonResponse(response);
-        if (!result) {
+        const parsed = parseJsonResponse(response);
+        if (!parsed) {
             throw new Error('Failed to parse extraction response');
         }
 
-        applyExtractionResult(data, result, pendingMsgs.filter(m => m.send_date).map(m => m.send_date));
+        const result = normalizeExtractionResult(parsed);
+        const resultStats = applyExtractionResult(data, result, pendingMsgs.filter(m => m.send_date).map(m => m.send_date));
+        trackTimelineHealth(data, resultStats, source);
         markMsgsExtracted(data, pendingMsgs);
         saveMemoryData();
     } else {
@@ -323,19 +604,22 @@ export async function performExtraction() {
             toastr?.info?.(`正在提取第 ${bi + 1}/${batches.length} 批...`, 'Memory Manager', { timeOut: 3000 });
 
             const prompt = buildExtractionPrompt(data, batchText);
+            touchExtractionActivity(data);
             const response = await callLLM(
                 '你是剧情记忆管理系统。严格按要求输出JSON。',
                 prompt,
                 initMaxTokens,
             );
 
-            const result = parseJsonResponse(response);
-            if (!result) {
+            const parsed = parseJsonResponse(response);
+            if (!parsed) {
                 warn(`Batch ${bi + 1}: Failed to parse response, skipping`);
                 continue;
             }
 
-            applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
+            const result = normalizeExtractionResult(parsed);
+            const resultStats = applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
+            trackTimelineHealth(data, resultStats, `${source}:batch-${bi + 1}`);
             markMsgsExtracted(data, batch.map(item => item.msg));
             saveMemoryData();
             log(`Batch ${bi + 1}/${batches.length} done. Pages: ${data.pages.length}`);
@@ -356,70 +640,194 @@ export async function performExtraction() {
     await safeCompress(false);
 }
 
-export async function safeExtract(force = false, range = null) {
+async function runQueuedExtraction() {
+    if (extractionQueue.running) {
+        extractionQueue.rerunRequested = true;
+        addRecentEvent(data, {
+            type: 'extract',
+            source,
+            started: false,
+            success: false,
+            api,
+            reason: 'skipped: no chat',
+        });
+        return { started: false, requeue: false, reason: 'no_chat' };
+    }
+
+    extractionQueue.running = true;
+    try {
+        do {
+            extractionQueue.rerunRequested = false;
+            const sources = [...extractionQueue.sources];
+            extractionQueue.sources.clear();
+            const source = sources.length > 0 ? sources.join(', ') : 'queued';
+            const result = await safeExtract(false, null, { source, queued: true });
+            if (result?.requeue) {
+                await new Promise(resolve => setTimeout(resolve, QUEUED_EXTRACTION_DELAY_MS));
+                if (extractionQueue.sources.size === 0) {
+                    extractionQueue.sources.add(source);
+                }
+                extractionQueue.rerunRequested = true;
+            }
+        } while (extractionQueue.rerunRequested || extractionQueue.sources.size > 0);
+    } finally {
+        extractionQueue.running = false;
+    }
+}
+
+export function queueExtractionRequest(source = 'unknown') {
+    const data = getMemoryData();
+    extractionQueue.sources.add(source);
+    addRecentEvent(data, {
+        type: 'trigger',
+        source,
+        started: false,
+        success: true,
+        api: getActiveApiName(),
+        reason: extractionQueue.running || extractionQueue.timerId ? 'merged into queued extraction' : 'queued',
+    });
+
+    if (extractionQueue.running || extractionQueue.timerId) return;
+
+    extractionQueue.timerId = setTimeout(() => {
+        extractionQueue.timerId = null;
+        runQueuedExtraction().catch(err => warn('Queued extraction failed:', err));
+    }, QUEUED_EXTRACTION_DELAY_MS);
+}
+
+export async function safeExtract(force = false, range = null, meta = {}) {
     const s = getSettings();
-    if (!s.enabled && !force) return;
+    if (!s.enabled && !force) return { started: false, requeue: false, reason: 'disabled' };
 
     const data = getMemoryData();
+    const source = meta.source || (force ? 'force' : 'auto');
+    const api = getActiveApiName();
+    const recovered = recoverStaleExtractionLock(data, force);
     if (data.processing.extractionInProgress) {
         if (force) {
-            // Force extraction overrides any stale lock (can't be running after a page reload)
-            warn('Force extract: clearing stale extractionInProgress lock');
-            data.processing.extractionInProgress = false;
-            saveMemoryData();
+            markLockRecovered(data, 'manual-force-reset');
+            clearExtractionLock(data);
+            toastr?.info?.('检测到提取锁未释放，已自动重置，开始强制提取...', 'Memory Manager', { timeOut: 4000 });
             toastr?.info?.('检测到提取锁未释放，已自动重置，开始强制提取...', 'Memory Manager', { timeOut: 4000 });
         } else {
             log('Extraction already in progress, skipping');
-            return;
+            addRecentEvent(data, {
+                type: 'extract',
+                source,
+                started: false,
+                success: false,
+                api,
+                reason: 'skipped: extraction already in progress',
+            });
+            return { started: false, requeue: true, reason: 'already_in_progress' };
         }
     }
 
     const ctx = getContext();
     if (!ctx.chat || ctx.chat.length === 0) {
         if (force) toastr?.info?.('当前没有聊天记录', 'Memory Manager');
-        return;
+        addRecentEvent(data, {
+            type: 'extract',
+            source,
+            started: false,
+            success: false,
+            api,
+            reason: 'skipped: no chat',
+        });
+        return { started: false, requeue: false, reason: 'no_chat' };
     }
 
     if (is_send_press) {
         log('Send in progress, deferring extraction');
         if (force) toastr?.warning?.('消息发送中，请稍后再试', 'Memory Manager');
-        return;
+        addRecentEvent(data, {
+            type: 'extract',
+            source,
+            started: false,
+            success: false,
+            api,
+            reason: 'skipped: send in progress',
+        });
+        return { started: false, requeue: true, reason: 'send_in_progress' };
     }
 
     if (force) {
+        addRecentEvent(data, {
+            type: 'extract_start',
+            source,
+            started: true,
+            success: true,
+            api,
+            reason: 'force extraction started',
+        });
         await forceExtractUnprocessed(data, ctx, s, range);
-    } else {
-        // Normal mode: date-mark-based incremental extraction
-        const dates = data.processing.extractedMsgDates || {};
-        const highestIdx = getHighestExtractedIndex(ctx.chat, dates);
+        return { started: true, requeue: false, reason: 'force_finished' };
+    }
 
-        const pendingCount = Math.max(0, ctx.chat.length - 1 - highestIdx);
-        if (pendingCount < s.extractionInterval) return;
+    const dates = data.processing.extractedMsgDates || {};
+    const { pendingMsgs } = getExtractionWindow(ctx.chat, dates, s);
+    const pendingCount = pendingMsgs.length;
+    if (pendingCount < s.extractionInterval) {
+        addRecentEvent(data, {
+            type: 'extract',
+            source,
+            started: false,
+            success: true,
+            api,
+            reason: `skipped: pending below threshold (${pendingCount}/${s.extractionInterval})`,
+        });
+        return { started: false, requeue: false, reason: 'below_threshold' };
+    }
 
-        data.processing.extractionInProgress = true;
-        saveMemoryData();
-        setMood('thinking');
+    markExtractionStarted(data);
+    setMood('thinking');
+    addRecentEvent(data, {
+        type: 'extract_start',
+        source,
+        started: true,
+        success: true,
+        api,
+        reason: `pending=${pendingCount}${recovered ? ', recovered=true' : ''}`,
+    });
 
-        try {
-            await performExtraction();
-            consecutiveFailures = 0;
+    try {
+            await performExtraction(source);
+            markExtractionSuccess(data);
             setMood('joyful', 5000);
             await hideProcessedMessages();
             _ui.updateBrowserUI?.();
+            addRecentEvent(data, {
+                type: 'extract',
+                source,
+                started: true,
+                success: true,
+                api,
+                recovered,
+                reason: `success: pending=${pendingCount}`,
+            });
+            return { started: true, requeue: false, reason: 'success' };
         } catch (err) {
             warn('Extraction failed:', err);
             setMood('sad', 5000);
-            consecutiveFailures++;
+            addRecentEvent(data, {
+                type: 'extract',
+                source,
+                started: true,
+                success: false,
+                api,
+                recovered,
+                reason: err.message,
+            });
+            markExtractionFailure(data, err.message);
             if (consecutiveFailures >= 3) {
                 toastr?.warning?.('记忆提取连续失败，请检查API状态', 'Memory Manager');
-                consecutiveFailures = 0;
+                setConsecutiveFailureCount(data, 0);
             }
+            return { started: true, requeue: false, reason: 'failed' };
         } finally {
-            data.processing.extractionInProgress = false;
-            saveMemoryData();
+            clearExtractionLock(data);
             _ui.updateStatusDisplay?.();
         }
-    }
 }
 
 /**
@@ -440,8 +848,7 @@ async function _worldBookOnlyExtraction(data, s) {
         return;
     }
 
-    data.processing.extractionInProgress = true;
-    saveMemoryData();
+    markExtractionStarted(data);
     setMood('thinking');
 
     const initMaxTokens = Math.max(s.extractionMaxTokens, 8192);
@@ -456,13 +863,24 @@ async function _worldBookOnlyExtraction(data, s) {
             initMaxTokens,
         );
 
-        const result = parseJsonResponse(response);
-        if (!result) {
+        const parsed = parseJsonResponse(response);
+        if (!parsed) {
             throw new Error('世界书提取结果解析失败');
         }
 
-        applyExtractionResult(data, result, []);
+        const result = normalizeExtractionResult(parsed);
+        const resultStats = applyExtractionResult(data, result, []);
+        trackTimelineHealth(data, resultStats, 'worldbook');
         saveMemoryData();
+        markExtractionSuccess(data);
+        addRecentEvent(data, {
+            type: 'extract',
+            source: 'worldbook',
+            started: true,
+            success: true,
+            api: getActiveApiName(),
+            reason: `pages=${resultStats.newPageCount}, timelineChanged=${resultStats.timelineChanged}`,
+        });
 
         _ui.updateInitProgressUI?.(1, 1, '世界书提取完成！');
         setMood('joyful', 5000);
@@ -483,10 +901,18 @@ async function _worldBookOnlyExtraction(data, s) {
     } catch (err) {
         warn('World book extraction failed:', err);
         setMood('sad', 5000);
+        markExtractionFailure(data, err.message);
+        addRecentEvent(data, {
+            type: 'extract',
+            source: 'worldbook',
+            started: true,
+            success: false,
+            api: getActiveApiName(),
+            reason: err.message,
+        });
         toastr?.error?.('世界书提取失败: ' + err.message, 'Memory Manager');
     } finally {
-        data.processing.extractionInProgress = false;
-        saveMemoryData();
+        clearExtractionLock(data);
         _ui.updateStatusDisplay?.();
     }
 }
@@ -526,8 +952,7 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
         return;
     }
 
-    data.processing.extractionInProgress = true;
-    saveMemoryData();
+    markExtractionStarted(data);
     setMood('thinking');
 
     // Gather world book context if requested (used during initialization)
@@ -567,21 +992,24 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
 
             try {
                 const prompt = buildExtractionPrompt(data, batchText, worldBookContext);
+                touchExtractionActivity(data);
                 const response = await callLLM(
                     '你是剧情记忆管理系统。严格按要求输出JSON。',
                     prompt,
                     initMaxTokens,
                 );
 
-                const result = parseJsonResponse(response);
-                if (!result) {
+                const parsed = parseJsonResponse(response);
+                if (!parsed) {
                     warn(`Force batch ${bi + 1}: Failed to parse response`);
                     forceFailedBatches.push({ index: bi, batch, reason: '解析失败' });
                     _ui.updateInitProgressUI?.(bi + 1, totalBatches, `第 ${bi + 1}/${totalBatches} 批解析失败，待重试`);
                     continue;
                 }
 
-                applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
+                const result = normalizeExtractionResult(parsed);
+                const resultStats = applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
+                trackTimelineHealth(data, resultStats, `force-batch-${bi + 1}`);
                 markMsgsExtracted(data, batch.map(item => item.msg));
 
                 saveMemoryData();
@@ -610,20 +1038,23 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
 
                 try {
                     const prompt = buildExtractionPrompt(data, batchText, worldBookContext);
+                    touchExtractionActivity(data);
                     const response = await callLLM(
                         '你是剧情记忆管理系统。严格按要求输出JSON。',
                         prompt,
                         initMaxTokens,
                     );
 
-                    const result = parseJsonResponse(response);
-                    if (!result) {
+                    const parsed = parseJsonResponse(response);
+                    if (!parsed) {
                         forceFailedBatches.push({ index: retryList[ri].index, batch, reason: '重试解析失败' });
                         _ui.updateInitProgressUI?.(ri + 1, retryList.length, `重试第 ${ri + 1}/${retryList.length} 批解析仍失败`);
                         continue;
                     }
 
-                    applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
+                    const result = normalizeExtractionResult(parsed);
+                    const resultStats = applyExtractionResult(data, result, batch.map(item => item.msg?.send_date).filter(Boolean));
+                    trackTimelineHealth(data, resultStats, `force-retry-${ri + 1}`);
                     markMsgsExtracted(data, batch.map(item => item.msg));
 
                     saveMemoryData();
@@ -639,6 +1070,15 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
 
         // Report results
         if (forceFailedBatches.length > 0) {
+            markExtractionFailure(data, `${forceFailedBatches.length} force batches failed`);
+            addRecentEvent(data, {
+                type: 'extract',
+                source: 'force',
+                started: true,
+                success: false,
+                api: getActiveApiName(),
+                reason: `${forceFailedBatches.length} failed batches after retry`,
+            });
             _ui.updateInitProgressUI?.(totalBatches, totalBatches, `完成！${forceFailedBatches.length} 批失败`);
             setMood('sad', 6000);
             toastr?.warning?.(
@@ -646,6 +1086,15 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
                 'Memory Manager', { timeOut: 8000 },
             );
         } else {
+            markExtractionSuccess(data);
+            addRecentEvent(data, {
+                type: 'extract',
+                source: 'force',
+                started: true,
+                success: true,
+                api: getActiveApiName(),
+                reason: `successBatches=${successCount}`,
+            });
             _ui.updateInitProgressUI?.(totalBatches, totalBatches, '强制提取完成！');
             setMood('joyful', 5000);
             toastr?.success?.(
@@ -669,10 +1118,18 @@ export async function forceExtractUnprocessed(data, ctx, s, range = null, option
     } catch (err) {
         warn('Force extraction error:', err);
         setMood('sad', 5000);
+        markExtractionFailure(data, err.message);
+        addRecentEvent(data, {
+            type: 'extract',
+            source: 'force',
+            started: true,
+            success: false,
+            api: getActiveApiName(),
+            reason: err.message,
+        });
         toastr?.error?.('强制提取出错: ' + err.message, 'Memory Manager');
     } finally {
-        data.processing.extractionInProgress = false;
-        saveMemoryData();
+        clearExtractionLock(data);
         _ui.updateStatusDisplay?.();
     }
 }

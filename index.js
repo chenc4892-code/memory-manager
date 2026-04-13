@@ -30,7 +30,7 @@ import { MODULE_NAME, PROMPT_KEY_INDEX, PROMPT_KEY_PAGES } from './src/constants
 import {
     getSettings, loadSettings, getMemoryData, saveMemoryData,
     saveSetting, getCurrentCharName, getActiveSlotName, listSlots,
-    toggleSecondaryApiFields, toggleAutoHideFields, toggleEmbeddingFields,
+    toggleSecondaryApiFields, toggleRequestTimeoutFields, toggleAutoHideFields, toggleEmbeddingFields,
 } from './src/data.js';
 import { isAuthorized, showAuthScreen, hideAuthScreen, bindAuthUI } from './src/auth.js';
 import { testSecondaryApi } from './src/api.js';
@@ -40,6 +40,7 @@ import { formatStoryIndex } from './src/formatting.js';
 import {
     setExtractionUI, resetConsecutiveFailures,
     safeExtract, hideProcessedMessages, recalculateHideRange,
+    queueExtractionRequest, resetExtractionQueue,
 } from './src/extraction.js';
 import { safeCompress } from './src/compression.js';
 import {
@@ -90,6 +91,15 @@ function bindSettingsPanel() {
         saveSetting('extractionInterval', v);
     });
     $('#mm_extraction_max_tokens').on('change', function () { saveSetting('extractionMaxTokens', Number(this.value)); });
+    $('#mm_request_timeout_enabled').on('change', function () {
+        saveSetting('requestTimeoutEnabled', this.checked);
+        toggleRequestTimeoutFields(this.checked);
+    });
+    $('#mm_request_timeout_seconds').on('change', function () {
+        const seconds = Math.max(5, Number(this.value) || 90);
+        $(this).val(seconds);
+        saveSetting('requestTimeoutSeconds', seconds);
+    });
     $('#mm_index_depth').on('change', function () { saveSetting('indexDepth', Number(this.value)); });
     $('#mm_recall_depth').on('change', function () { saveSetting('recallDepth', Number(this.value)); });
     $('#mm_max_pages').on('input', function () {
@@ -236,7 +246,7 @@ function bindSettingsPanel() {
             `· 正常情况下自动提取会自行处理新消息\n\n` +
             `确定继续？`,
         );
-        if (ok) safeExtract(true);
+        if (ok) safeExtract(true, null, { source: 'manual-force' });
     });
     $('#mm_force_compress').on('click', async () => {
         await safeCompress(true);
@@ -279,9 +289,9 @@ function bindSettingsPanel() {
 
 // ── Event Handlers ──
 
-async function onChatEvent() {
+function onChatEvent(source = 'chat-event') {
     if (!getSettings().enabled) return;
-    setTimeout(() => safeExtract(false), 500);
+    queueExtractionRequest(source);
 }
 
 function onMessageDeleted() {
@@ -321,10 +331,13 @@ function onChatChanged() {
     setExtensionPrompt(PROMPT_KEY_PAGES, '', extension_prompt_types.IN_CHAT, 0);
     resetRetrievalState();
     resetConsecutiveFailures();
+    resetExtractionQueue();
 
     const data = getMemoryData();
     if (data.processing.extractionInProgress) {
         data.processing.extractionInProgress = false;
+        data.processing.extractionStartedAt = 0;
+        data.processing.lastExtractionActivityAt = 0;
         saveMemoryData(); // Persist the reset — prevents stale lock from surviving page reloads on the same chat
     }
 
@@ -379,11 +392,12 @@ function fullInitialize() {
 
     // Register events
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-    eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, onChatEvent);
+    eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, () => onChatEvent('character_rendered'));
+    eventSource.makeLast(event_types.USER_MESSAGE_RENDERED, () => onChatEvent('user_rendered'));
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageRendered);
-    for (const evt of [event_types.MESSAGE_DELETED, event_types.MESSAGE_UPDATED, event_types.MESSAGE_SWIPED]) {
-        eventSource.on(evt, onChatEvent);
-    }
+    eventSource.on(event_types.MESSAGE_DELETED, () => onChatEvent('message_deleted'));
+    eventSource.on(event_types.MESSAGE_UPDATED, () => onChatEvent('message_updated'));
+    eventSource.on(event_types.MESSAGE_SWIPED, () => onChatEvent('message_swiped'));
     eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
 
     registerSlashCommands();

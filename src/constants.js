@@ -74,6 +74,8 @@ export const DEFAULT_SETTINGS = {
     secondaryApiKey: '',
     secondaryApiModel: '',
     secondaryApiTemperature: 0.3,
+    requestTimeoutEnabled: false,
+    requestTimeoutSeconds: 90,
     // Known characters
     knownCharacters: '',
     // NPC injection mode: 'half' | 'full' | 'keyword'

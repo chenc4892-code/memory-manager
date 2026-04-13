@@ -23,6 +23,21 @@ import {
 
 const $ = window.jQuery;
 
+function createDefaultDiagnostics() {
+    return {
+        consecutiveFailures: 0,
+        lastSuccessfulExtractionAt: 0,
+        lastFailureAt: 0,
+        lastFailureReason: '',
+        lastLockRecoveryAt: 0,
+        lastLockRecoveryReason: '',
+        lastHealthNotice: '',
+        lastHealthNoticeAt: 0,
+        timelineNoChangeWarnings: 0,
+        recentEvents: [],
+    };
+}
+
 // ── Settings ──
 
 export function getSettings() {
@@ -72,6 +87,9 @@ export function loadSettings() {
     $('#mm_max_pages').val(s.maxPages);
     $('#mm_max_pages_value').text(s.maxPages);
     $('#mm_show_recall_badges').prop('checked', s.showRecallBadges);
+    $('#mm_request_timeout_enabled').prop('checked', !!s.requestTimeoutEnabled);
+    $('#mm_request_timeout_seconds').val(s.requestTimeoutSeconds ?? 90);
+    toggleRequestTimeoutFields(!!s.requestTimeoutEnabled);
 
     // Compression
     $('#mm_compress_timeline').prop('checked', s.compressTimeline);
@@ -117,6 +135,10 @@ export function toggleSecondaryApiFields(show) {
     $('#mm_secondary_api_fields').toggle(show);
 }
 
+export function toggleRequestTimeoutFields(show) {
+    $('#mm_request_timeout_fields').toggle(show);
+}
+
 export function toggleAutoHideFields(show) {
     $('#mm_auto_hide_fields').toggle(show);
 }
@@ -142,9 +164,12 @@ export function createDefaultData() {
         embeddings: {},
         processing: {
             extractionInProgress: false,
+            extractionStartedAt: 0,
+            lastExtractionActivityAt: 0,
             extractedMsgDates: {},
         },
         messageRecalls: {},
+        diagnostics: createDefaultDiagnostics(),
         managerDirective: {
             global: '',
             extraction: '',
@@ -288,6 +313,25 @@ export function getMemoryData() {
     }
     if (!d.processing.extractedMsgDates) {
         d.processing.extractedMsgDates = {};
+    }
+    if (typeof d.processing.extractionStartedAt !== 'number') {
+        d.processing.extractionStartedAt = 0;
+    }
+    if (typeof d.processing.lastExtractionActivityAt !== 'number') {
+        d.processing.lastExtractionActivityAt = 0;
+    }
+    if (!d.diagnostics || typeof d.diagnostics !== 'object') {
+        d.diagnostics = createDefaultDiagnostics();
+    } else {
+        const defaults = createDefaultDiagnostics();
+        for (const [key, value] of Object.entries(defaults)) {
+            if (d.diagnostics[key] === undefined) {
+                d.diagnostics[key] = Array.isArray(value) ? [...value] : value;
+            }
+        }
+        if (!Array.isArray(d.diagnostics.recentEvents)) {
+            d.diagnostics.recentEvents = [];
+        }
     }
     // Clean up deprecated watermark field
     delete d.processing.lastExtractedMessageId;
